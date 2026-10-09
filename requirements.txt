@@ -1,0 +1,8 @@
+pandas
+scikit-learn
+streamlit
+scapy
+requests
+reportlab
+psutil
+watchdog

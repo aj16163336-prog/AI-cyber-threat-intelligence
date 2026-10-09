@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: ai-cti-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements-backend.txt
+    startCommand: uvicorn backend_api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: ai-cti-db
+          property: connectionString
+      - key: API_TOKEN
+        generateValue: true
+
+databases:
+  - name: ai-cti-db
+    databaseName: cti
+    user: cti
+    plan: free
+    ipAllowList: []
