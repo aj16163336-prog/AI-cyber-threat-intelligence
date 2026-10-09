@@ -69,8 +69,18 @@ def init_database():
                 severity TEXT NOT NULL,
                 details TEXT NOT NULL,
                 mitre_id TEXT,
+                source_event_id TEXT,
                 status TEXT NOT NULL DEFAULT 'Open'
             )"""
+        )
+        alert_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(alerts)")
+        }
+        if "source_event_id" not in alert_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN source_event_id TEXT")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_source_event_id "
+            "ON alerts(source_event_id)"
         )
         connection.execute(
             """CREATE TABLE IF NOT EXISTS incidents (
@@ -112,6 +122,75 @@ def add_alert(title, severity, details, mitre_id=""):
                 mitre_id,
             ),
         )
+
+
+def sync_endpoint_alerts(events):
+    """Turn endpoint events marked for review into deduplicated alerts."""
+    if events is None or events.empty or "severity" not in events.columns:
+        return 0
+
+    severity_map = {"Review": "Medium", "High": "High", "Critical": "Critical"}
+
+    def value(event, key, default=""):
+        result = event.get(key, default)
+        if result is None or pd.isna(result):
+            return default
+        return str(result).strip()
+
+    inserted = 0
+    with connect_db() as connection:
+        for event in events.to_dict("records"):
+            event_severity = value(event, "severity").title()
+            if event_severity not in severity_map:
+                continue
+
+            event_id = value(event, "event_id")
+            if not event_id:
+                event_id = value(event, "event_uid") or value(event, "id")
+            if not event_id:
+                continue
+
+            summary = value(event, "summary", "Endpoint event needs review")
+            event_type = value(event, "event_type", "endpoint_event")
+            occurred_at = value(
+                event,
+                "occurred_at",
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            )
+            risk_score = value(event, "risk_score", "0")
+            details = [
+                "Source: Windows endpoint sensor",
+                f"Event type: {event_type}",
+                f"Risk score: {risk_score}/100",
+                f"Signal: {summary}",
+            ]
+            for key, label in (
+                ("file_name", "File"),
+                ("folder", "Folder"),
+                ("process_name", "Process"),
+                ("remote_ip", "Remote IP"),
+                ("remote_port", "Remote port"),
+                ("details", "Assessment"),
+            ):
+                item = value(event, key)
+                if item:
+                    details.append(f"{label}: {item}")
+
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO alerts
+                   (created_at, title, severity, details, mitre_id,
+                    source_event_id, status)
+                   VALUES (?, ?, ?, ?, '', ?, 'Open')""",
+                (
+                    occurred_at,
+                    f"Endpoint signal: {summary}",
+                    severity_map[event_severity],
+                    "\n".join(details),
+                    f"endpoint:{event_id}",
+                ),
+            )
+            inserted += max(cursor.rowcount, 0)
+    return inserted
 
 
 def add_incident(title, severity, notes):
@@ -424,6 +503,10 @@ def render_endpoint_security():
             st.rerun()
         return
 
+    new_alerts = sync_endpoint_alerts(events)
+    if new_alerts:
+        st.success(f"Added {new_alerts} endpoint review alert(s) to Alert System.")
+
     review_count = int(events["severity"].isin(["Review", "High", "Critical"]).sum())
     file_count = int(events["event_type"].astype(str).str.startswith("file_").sum())
     process_count = int((events["event_type"] == "process_started").sum())
@@ -558,9 +641,20 @@ def render_mitre_map():
 
 def render_alert_system():
     st.title("Alert System")
+    try:
+        endpoint_events, _ = load_sensor_events(limit=1000)
+        new_alerts = sync_endpoint_alerts(endpoint_events)
+        if new_alerts:
+            st.success(f"Added {new_alerts} endpoint review alert(s).")
+    except Exception as error:
+        st.warning(f"Could not check live endpoint events: {error}")
+
     alerts = load_alerts()
     if alerts.empty:
-        st.info("No alerts have been recorded. Alerts are created by live capture or IOC matches.")
+        st.info(
+            "No alerts have been recorded. Endpoint events marked Review, High, or Critical "
+            "are added here automatically when this page is opened."
+        )
         return
 
     st.dataframe(alerts, hide_index=True, width="stretch")
