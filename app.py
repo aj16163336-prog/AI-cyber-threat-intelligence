@@ -1554,6 +1554,17 @@ def render_alert_system():
         )
         return
 
+    active_count = int(alerts["status"].isin(["Open", "Acknowledged"]).sum())
+    if st.button("Clear all active alerts", disabled=active_count == 0, type="secondary"):
+        with connect_db() as connection:
+            cursor = connection.execute(
+                "UPDATE alerts SET status = 'Closed' WHERE status IN ('Open', 'Acknowledged')"
+            )
+        cleared_count = max(int(cursor.rowcount), 0)
+        audit_event("alerts_cleared_in_bulk", f"count={cleared_count}; status=Closed")
+        st.success(f"Cleared {cleared_count} active alert(s). They are marked Closed and remain in the alert history.")
+        st.rerun()
+
     severity_order = ["Critical", "High", "Medium", "Low"]
     chosen_severities = st.multiselect("Filter severity", severity_order, default=severity_order)
     chosen_statuses = st.multiselect("Filter status", ["Open", "Acknowledged", "Closed", "Resolved"], default=["Open", "Acknowledged"])
