@@ -341,7 +341,7 @@ def load_incidents():
 
 
 def notify_security_alert(severity, title):
-    """Show in-app alert and optionally send a configured SMTP notification."""
+    """Show an in-app notification and email qualifying new alerts."""
     ranks = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
     threshold = st.session_state.get("alert_notification_threshold", setting("ALERT_NOTIFY_MINIMUM", "High"))
     if ranks.get(str(severity), 0) < ranks.get(str(threshold), 3):
@@ -349,32 +349,41 @@ def notify_security_alert(severity, title):
     st.toast(f"{severity} alert: {title}", icon="🚨")
     if setting("EMAIL_ALERTS_ENABLED", "false").lower() not in {"1", "true", "yes"}:
         return
-    host, recipient = setting("SMTP_HOST"), setting("ALERT_EMAIL_TO")
-    sender = setting("SMTP_FROM", setting("SMTP_USERNAME"))
-    if not (host and recipient and sender):
-        return
-    last_sent = st.session_state.get("last_alert_email_sent_at")
-    if last_sent:
-        try:
-            if (datetime.now(timezone.utc) - datetime.fromisoformat(last_sent)).total_seconds() < 300:
-                return
-        except ValueError:
-            pass
-    message = EmailMessage()
-    message["Subject"] = f"{severity} security alert: {title[:100]}"
-    message["From"] = sender
-    message["To"] = recipient
-    message.set_content(f"A security alert requires review.\n\nSeverity: {severity}\nAlert: {title}\n\nSign in to the AI Cyber Threat Intelligence app for details.")
     try:
-        with smtplib.SMTP(host, int(setting("SMTP_PORT", "587")), timeout=10) as server:
-            server.starttls()
-            username, password = setting("SMTP_USERNAME"), setting("SMTP_PASSWORD")
-            if username and password:
-                server.login(username, password)
-            server.send_message(message)
+        recipient = send_security_email(
+            f"{severity} security alert: {title[:100]}",
+            f"A security alert requires review.\n\nSeverity: {severity}\nAlert: {title}\n\nSign in to the AI Cyber Threat Intelligence app for details.",
+        )
         audit_event("email_alert_sent", f"severity={severity}; recipient={recipient}")
     except Exception as error:
+        audit_event("email_alert_failed", f"severity={severity}; error={str(error)[:300]}")
         st.warning(f"Email alert could not be sent: {error}")
+
+
+def send_security_email(subject, body):
+    """Send one email using SMTP settings supplied through private app secrets."""
+    host = setting("SMTP_HOST")
+    recipient = setting("ALERT_EMAIL_TO")
+    username, password = setting("SMTP_USERNAME"), setting("SMTP_PASSWORD")
+    sender = setting("SMTP_FROM", username)
+    if not all((host, recipient, sender)):
+        raise ValueError("Email settings are incomplete. Configure SMTP_HOST, SMTP_FROM, and ALERT_EMAIL_TO in app Secrets.")
+    port = int(setting("SMTP_PORT", "587"))
+    message = EmailMessage()
+    message["Subject"] = subject[:180]
+    message["From"] = sender
+    message["To"] = recipient
+    message.set_content(body)
+    smtp_class = smtplib.SMTP_SSL if setting("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes"} or port == 465 else smtplib.SMTP
+    with smtp_class(host, port, timeout=15) as server:
+        if smtp_class is smtplib.SMTP and setting("SMTP_USE_STARTTLS", "true").lower() in {"1", "true", "yes"}:
+            server.starttls()
+        if username:
+            if not password:
+                raise ValueError("SMTP_PASSWORD is missing for the configured SMTP_USERNAME.")
+            server.login(username, password)
+        server.send_message(message)
+    return recipient
 
 
 def add_alert(title, severity, details, mitre_id=""):
@@ -1504,8 +1513,27 @@ def map_signal_to_mitre(signal):
 @st.fragment(run_every="10s")
 def render_alert_system():
     render_page_heading("Alert System")
-    notification_minimum = st.selectbox("In-app notification threshold", ["Critical", "High", "Medium", "Low"], index=1, key="alert_notification_threshold")
-    st.caption("New alerts at or above this level appear as in-app notifications. Optional email alerts require SMTP settings in app Secrets.")
+    severity_levels = ["Critical", "High", "Medium", "Low"]
+    configured_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
+    default_index = severity_levels.index(configured_threshold) if configured_threshold in severity_levels else 1
+    notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
+    email_enabled = setting("EMAIL_ALERTS_ENABLED", "false").lower() in {"1", "true", "yes"}
+    if email_enabled:
+        st.success(f"Email notifications are enabled for alerts at or above {notification_minimum} severity.")
+        if st.button("Send test email"):
+            try:
+                recipient = send_security_email(
+                    "AI Cyber Threat Intelligence — test notification",
+                    "This is a test email. SMTP is configured and email notifications are ready.",
+                )
+                audit_event("email_alert_test_sent", f"recipient={recipient}")
+                st.success(f"Test email sent to {recipient}.")
+            except Exception as error:
+                audit_event("email_alert_test_failed", str(error)[:300])
+                st.error(f"Test email failed: {error}")
+    else:
+        st.info("Email notifications are off. Enable EMAIL_ALERTS_ENABLED and configure SMTP in your app's private Secrets, then restart/redeploy the app.")
+    st.caption("Every new alert at or above the selected level triggers an in-app notification and, when configured, an email. Repeated records are deduplicated by the alert engine.")
     try:
         endpoint_events, _ = load_sensor_events(limit=1000)
         new_alerts = sync_endpoint_alerts(endpoint_events)
