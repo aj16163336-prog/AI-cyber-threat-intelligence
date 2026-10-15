@@ -10,6 +10,13 @@ Windows endpoint and network monitoring project with a local sensor, authenticat
 - The sensor stores full local paths in the laptop's SQLite database. Cloud sync sends only event metadata: folder label, filename, file hash, process name, remote IP/port, event summary, and risk fields. File contents and packet payloads are never uploaded.
 - A file extension or feed match is a review signal, not proof that a file or device is infected. The sensor does not delete, quarantine, or block traffic.
 - The UNSW-NB15 Random Forest remains a historical flow-dataset benchmark. It is kept separate from live endpoint signals; no mismatched live features are sent into that model.
+- The AI Engine refreshes endpoint event metadata every 10 seconds and runs a rolling Isolation Forest after collecting enough events. It shows a combined risk score, severity, and signal reasons; these are triage signals, not a malware verdict.
+- The Explainable AI Assistant presents the selected event's risk components, reasons, and suggested analyst checks. The AI Model Evaluation Lab measures accuracy, balanced accuracy, F1, per-class results, confusion matrix, and feature importance on a held-out split. CSV upload is enabled only in the local desktop app; the bundled UNSW-NB15 train/test files can also be evaluated when present.
+- The Alert Center refreshes every 10 seconds and automatically promotes new sensor and live-model anomalies to deduplicated review alerts. It supports severity/status filters, acknowledgement and resolution, in-app notifications, and optional SMTP email alerts. Related alerts can be grouped into an incident.
+- The MITRE ATT&CK page maps matching live event text, alerts, and offline report categories to candidate techniques, with rationale and links. Mappings are tentative and require analyst review.
+- IOC Analysis checks IPs against Feodo Tracker and can query VirusTotal for IPs, domains, or hashes when `VT_API_KEY` is configured. Only the manually entered indicator is sent to VirusTotal; files are never uploaded.
+- The local Log Analyzer accepts authorized text/CSV logs up to 5 MB, detects common failed-login and suspicious-script patterns, and creates deduplicated alerts. Log uploads are disabled outside the local desktop app.
+- Analytics and reports include live event counts, severity and daily trends, filters, and PDF/CSV export. Audit records track sign-ins, IOC checks, report exports, and alert/incident updates.
 
 ## Local Windows run
 
@@ -22,7 +29,7 @@ Requirements: Windows, Python, VS Code, and Npcap for packet capture. The endpoi
 pip install -r requirements.txt
 ```
 
-2. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set your own long, unique `APP_PASSWORD`. Keep `secrets.toml` private; it is ignored by Git.
+2. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set your own long, unique `APP_PASSWORD`. Keep `secrets.toml` private; it is ignored by Git. `VT_API_KEY` is optional and is required for VirusTotal domain/hash lookups. Email notifications are optional; set `EMAIL_ALERTS_ENABLED = "true"` plus `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, `ALERT_EMAIL_TO`, and (when needed) `SMTP_USERNAME` / `SMTP_PASSWORD`. Keep all secrets private.
 
 3. In one VS Code terminal, start the local endpoint sensor:
 
