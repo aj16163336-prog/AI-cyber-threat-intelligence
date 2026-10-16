@@ -113,6 +113,14 @@ def apply_theme():
             --cti-olive: #8a852b;
             --cti-red: #e67d73;
         }
+        @keyframes cti-arrive {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes cti-signal-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 #cede6220, 0 0 12px #cede6270; }
+            50% { box-shadow: 0 0 0 5px #cede6208, 0 0 18px #cede6280; }
+        }
         html, body, [data-testid="stAppViewContainer"] {
             background: radial-gradient(ellipse at 80% 0%, #171a15 0%, var(--cti-bg) 42%);
             color: var(--cti-ink);
@@ -123,6 +131,9 @@ def apply_theme():
         [data-testid="stMainBlockContainer"] {
             max-width: 1500px;
             padding: 2.1rem 2.5rem 3rem;
+        }
+        [data-testid="stMainBlockContainer"] > div > div > div[data-testid="stVerticalBlock"] {
+            animation: cti-arrive .34s ease-out both;
         }
         [data-testid="stSidebar"] {
             background: linear-gradient(180deg, #131614 0%, #101211 100%);
@@ -141,6 +152,12 @@ def apply_theme():
             border: 1px solid var(--cti-border);
             border-radius: 14px;
             background: linear-gradient(145deg, #191d1a 0%, #131614 100%);
+            transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease;
+        }
+        [data-testid="stMetric"]:hover {
+            transform: translateY(-2px);
+            border-color: #505a3e;
+            box-shadow: 0 10px 28px #00000025;
         }
         [data-testid="stMetricLabel"] p {
             color: #aab0a8; font-size: .76rem; font-weight: 600;
@@ -152,6 +169,11 @@ def apply_theme():
             border-color: var(--cti-border) !important;
             border-radius: 14px;
             background: linear-gradient(145deg, #171a18 0%, #131614 100%);
+            transition: border-color .2s ease, box-shadow .2s ease;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"]:hover {
+            border-color: #3b4436 !important;
+            box-shadow: 0 8px 24px #0000001e;
         }
         [data-testid="stDataFrame"] {
             border: 1px solid var(--cti-border);
@@ -201,6 +223,12 @@ def apply_theme():
         }
         [data-testid="stButton"] button:hover, [data-testid="stDownloadButton"] button:hover {
             border-color: var(--cti-lime); color: var(--cti-lime);
+            transform: translateY(-1px);
+            box-shadow: 0 5px 16px #cede6215;
+        }
+        [data-testid="stButton"] button, [data-testid="stDownloadButton"] button,
+        [data-testid="stFormSubmitButton"] button {
+            transition: transform .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease;
         }
         [data-testid="stFormSubmitButton"] button[kind="primary"],
         [data-testid="stButton"] button[kind="primary"] {
@@ -227,12 +255,13 @@ def apply_theme():
             padding:.65rem .75rem; border:1px solid #303a2b; border-radius:10px;
             background:#1b2118; color:#d5e28a; font-size:.78rem; font-weight:600;
         }
-        .cti-dot { width:.48rem; height:.48rem; border-radius:50%; background:var(--cti-lime); box-shadow:0 0 12px #cede6270; }
+        .cti-dot { width:.48rem; height:.48rem; border-radius:50%; background:var(--cti-lime); animation:cti-signal-pulse 2.4s ease-in-out infinite; }
         .cti-page-heading {
             display:flex; justify-content:space-between; align-items:flex-end; gap:1rem;
             padding:0 0 1.4rem; margin-bottom:1.1rem; border-bottom:1px solid var(--cti-border);
         }
         .cti-page-heading h1 { margin:.35rem 0 .35rem; }
+        .cti-page-heading h1 { animation:cti-arrive .42s ease-out both; }
         .cti-page-heading p { margin:0; max-width:52rem; color:#a3aaa2; }
         .cti-status {
             flex:0 0 auto; display:flex; align-items:center; gap:.5rem;
@@ -243,7 +272,10 @@ def apply_theme():
             display:flex; justify-content:space-between; align-items:center; gap:1rem;
             padding:1.5rem 1.6rem; margin-bottom:1.15rem; border:1px solid #323a2f;
             border-radius:16px; background:linear-gradient(115deg,#1b2018 0%,#141715 70%);
+            box-shadow:inset 3px 0 0 #cede6240, 0 12px 35px #00000015;
+            transition:transform .2s ease, border-color .2s ease;
         }
+        .cti-hero:hover { transform:translateY(-2px); border-color:#596137; }
         .cti-hero h2 { margin:.35rem 0 .45rem; font-size:1.45rem; }
         .cti-hero p { margin:0; max-width:48rem; }
         .cti-hero-mark {
@@ -260,6 +292,9 @@ def apply_theme():
             [data-testid="stMainBlockContainer"] { padding:1.2rem 1rem 2rem; }
             .cti-page-heading { align-items:flex-start; flex-direction:column; }
             .cti-hero { align-items:flex-start; }
+        }
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; scroll-behavior:auto !important; transition-duration:.01ms !important; }
         }
         </style>
         """,
