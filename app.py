@@ -672,6 +672,81 @@ def load_sensor_events(limit=500):
         ), "local"
 
 
+def sensor_health_status(events, source):
+    """Report local sensor process health, or cloud telemetry recency without guessing process state."""
+    if source == "cloud":
+        if events.empty:
+            return "Waiting for telemetry", "The cloud API has not received an endpoint event yet."
+        time_column = next((name for name in ("occurred_at", "created_at") if name in events.columns), None)
+        if not time_column:
+            return "Telemetry available", "Endpoint events are available, but their timestamps are missing."
+        timestamps = pd.to_datetime(events[time_column], utc=True, errors="coerce").dropna()
+        if timestamps.empty:
+            return "Telemetry available", "Endpoint events are available, but their timestamps could not be read."
+        latest = timestamps.max()
+        age_seconds = max(0, (datetime.now(timezone.utc) - latest.to_pydatetime()).total_seconds())
+        age_minutes = int(age_seconds // 60)
+        if age_seconds <= 120:
+            return "Recent telemetry", "The cloud received an endpoint event within the last 2 minutes."
+        return "No recent telemetry", f"Last cloud event was about {age_minutes} minute(s) ago; quiet activity does not prove the sensor is stopped."
+
+    if os.name != "nt" and os.environ.get("CTI_DESKTOP_MODE") != "1":
+        return "Laptop sensor not visible", "A hosted dashboard cannot inspect the laptop process directly. Use the local desktop app or connect the endpoint API."
+
+    try:
+        import psutil
+        expected_script = os.path.normcase(os.path.abspath(BASE_DIR / "endpoint_monitor.py"))
+        running = False
+        for process in psutil.process_iter(["cmdline"]):
+            try:
+                for argument in process.info.get("cmdline") or []:
+                    if os.path.normcase(os.path.abspath(str(argument))) == expected_script:
+                        running = True
+                        break
+            except (psutil.Error, OSError, TypeError, ValueError):
+                continue
+            if running:
+                break
+    except (ImportError, OSError):
+        return "Status unavailable", "Process monitoring is unavailable on this computer."
+    if running:
+        return "Running", "The local endpoint sensor process is active on this computer."
+    return "Stopped", "The local endpoint sensor process is not running. Start the desktop app to launch it."
+
+
+@st.fragment(run_every="5s")
+def render_dashboard_alert_inbox():
+    """Show persistent in-app alerts and let the analyst acknowledge one quickly."""
+    alerts = load_alerts()
+    open_alerts = alerts[alerts["status"] == "Open"] if not alerts.empty else alerts
+    active_alerts = alerts[alerts["status"].isin(["Open", "Acknowledged"])] if not alerts.empty else alerts
+    st.markdown('<div class="cti-section-label">In-app alert inbox</div>', unsafe_allow_html=True)
+    if active_alerts.empty:
+        st.caption("No active in-app alerts. New alerts will appear here and in the Alert System.")
+        return
+    st.caption(f"{len(open_alerts)} need acknowledgement · {len(active_alerts)} active")
+    shown = active_alerts.head(5)
+    columns = [name for name in ("created_at", "title", "severity", "status") if name in shown.columns]
+    st.dataframe(shown[columns], hide_index=True, width="stretch")
+    if not open_alerts.empty:
+        alert_options = {
+            f"#{row.id} · {row.severity} · {str(row.title)[:80]}": int(row.id)
+            for row in open_alerts.itertuples()
+        }
+        selected_label = st.selectbox(
+            "Alert to acknowledge", list(alert_options), key="dashboard_alert_ack_selection"
+        )
+        if st.button("Acknowledge alert", key="dashboard_acknowledge_alert"):
+            selected_id = alert_options[selected_label]
+            with connect_db() as connection:
+                connection.execute(
+                    "UPDATE alerts SET status = 'Acknowledged' WHERE id = ? AND status = 'Open'",
+                    (selected_id,),
+                )
+            audit_event("alert_status_changed", f"alert_id={selected_id}; status=Acknowledged")
+            st.rerun()
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_feodo_feed():
     response = requests.get(
@@ -792,6 +867,17 @@ def render_dashboard(report):
     col3.metric("Critical model risks", critical)
     col4.metric("Open incidents", open_incidents)
 
+    @st.fragment(run_every="5s")
+    def sensor_health_tile():
+        try:
+            latest_events, latest_source = load_sensor_events(limit=500)
+            health, explanation = sensor_health_status(latest_events, latest_source)
+            st.metric("Endpoint sensor", health, help=explanation)
+        except Exception:
+            st.metric("Endpoint sensor", "Unavailable", help="Could not read sensor status or recent telemetry.")
+
+    sensor_health_tile()
+
     if not report.empty and "risk_level" in report.columns:
         left, right = st.columns(2)
         with left:
@@ -837,12 +923,7 @@ def render_dashboard(report):
             else:
                 st.info("No capture summary yet. Start a capture from Live Monitor.")
 
-            st.markdown('<div class="cti-section-label">Recent alerts</div>', unsafe_allow_html=True)
-            if alerts.empty:
-                st.caption("No alerts have been recorded.")
-            else:
-                columns = [name for name in ("created_at", "title", "severity", "status") if name in alerts.columns]
-                st.dataframe(alerts[columns].head(5), hide_index=True, width="stretch")
+            render_dashboard_alert_inbox()
 
 
 def render_live_monitor():
@@ -988,6 +1069,9 @@ def render_endpoint_security():
             st.rerun()
 
         st.caption("Event source: " + ("deployed API" if source == "cloud" else "this computer") + " · Auto-refresh: 5 sec")
+        sensor_state, sensor_explanation = sensor_health_status(events, source)
+        st.metric("Sensor health", sensor_state, help=sensor_explanation)
+        st.caption(sensor_explanation)
         if events.empty:
             st.info("No events have arrived yet. Start the sensor; this list refreshes automatically.")
             return
@@ -1661,7 +1745,7 @@ def render_local_email_settings():
             current_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
             threshold_index = threshold_options.index(current_threshold) if current_threshold in threshold_options else 1
             st.selectbox("Minimum alert severity", threshold_options, index=threshold_index, key="local_email_threshold")
-            host = st.text_input("SMTP host", value=setting("SMTP_HOST"), placeholder="smtp.your-provider.com")
+            host = st.text_input("SMTP host", value=setting("SMTP_HOST", "smtp.gmail.com"), placeholder="smtp.your-provider.com")
             port = st.text_input("SMTP port", value=setting("SMTP_PORT", "587"))
             username = st.text_input("SMTP username", value=setting("SMTP_USERNAME"))
             saved_password = bool(setting("SMTP_PASSWORD"))
@@ -1672,7 +1756,7 @@ def render_local_email_settings():
             recipient = st.text_input("Alert recipient email", value=setting("ALERT_EMAIL_TO"))
             starttls = st.checkbox("Use STARTTLS (usually port 587)", value=setting("SMTP_USE_STARTTLS", "true").lower() in {"1", "true", "yes"})
             use_ssl = st.checkbox("Use SSL (usually port 465)", value=setting("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes"})
-            st.caption("Common settings: Gmail → smtp.gmail.com, port 587, STARTTLS; Outlook → smtp.office365.com, port 587, STARTTLS. For port 465, choose SSL and turn STARTTLS off.")
+            st.caption("Gmail is prefilled. Create a Google App Password and enter it above; your regular Gmail password will not work. The app password is stored locally on this computer and never uploaded. Gmail → smtp.gmail.com, port 587, STARTTLS.")
             submitted = st.form_submit_button("Save local email settings")
         if submitted:
             try:
