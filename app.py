@@ -902,44 +902,44 @@ def render_endpoint_security():
             "`Start AI CTI Sensor` shortcut on the laptop, then select `Refresh events`."
         )
 
-    try:
-        events, source = load_sensor_events()
-    except Exception as error:
-        st.error(f"Could not load sensor events: {error}")
-        return
+    @st.fragment(run_every="5s")
+    def endpoint_panel():
+        try:
+            events, source = load_sensor_events()
+        except Exception as error:
+            st.error(f"Could not load sensor events: {error}")
+            return
 
-    if st.button("Refresh events", key="refresh_endpoint_events"):
-        load_sensor_events.clear()
-        st.rerun()
-
-    st.caption("Event source: " + ("deployed API" if source == "cloud" else "this computer"))
-    if events.empty:
-        st.info("No events have arrived yet. Start the sensor, then refresh the event list.")
-        if st.button("Refresh events"):
+        if st.button("Refresh events", key="refresh_endpoint_events"):
+            load_sensor_events.clear()
             st.rerun()
-        return
 
-    new_alerts = sync_endpoint_alerts(events)
-    if new_alerts:
-        st.success(f"Added {new_alerts} endpoint review alert(s) to Alert System.")
+        st.caption("Event source: " + ("deployed API" if source == "cloud" else "this computer") + " · Auto-refresh: 5 sec")
+        if events.empty:
+            st.info("No events have arrived yet. Start the sensor; this list refreshes automatically.")
+            return
 
-    review_count = int(events["severity"].isin(["Review", "High", "Critical"]).sum())
-    file_count = int(events["event_type"].astype(str).str.startswith("file_").sum())
-    process_count = int((events["event_type"] == "process_started").sum())
-    connection_count = int((events["event_type"] == "network_connection").sum())
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Events", len(events))
-    c2.metric("Needs review", review_count)
-    c3.metric("File events", file_count)
-    c4.metric("Process / connection events", process_count + connection_count)
+        new_alerts = sync_endpoint_alerts(events)
+        if new_alerts:
+            st.success(f"Added {new_alerts} endpoint review alert(s) to Alert System.")
 
-    if source == "local" and "synced" in events.columns:
-        st.caption(
-            f"Cloud-synced events: {int(events['synced'].fillna(0).astype(int).sum())} / {len(events)}"
-        )
-    st.dataframe(events, hide_index=True, width="stretch")
-    if st.button("Refresh events"):
-        st.rerun()
+        review_count = int(events["severity"].isin(["Review", "High", "Critical"]).sum())
+        file_count = int(events["event_type"].astype(str).str.startswith("file_").sum())
+        process_count = int((events["event_type"] == "process_started").sum())
+        connection_count = int((events["event_type"] == "network_connection").sum())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Events", len(events))
+        c2.metric("Needs review", review_count)
+        c3.metric("File events", file_count)
+        c4.metric("Process / connection events", process_count + connection_count)
+
+        if source == "local" and "synced" in events.columns:
+            st.caption(
+                f"Cloud-synced events: {int(events['synced'].fillna(0).astype(int).sum())} / {len(events)}"
+            )
+        st.dataframe(events, hide_index=True, width="stretch")
+
+    endpoint_panel()
 
 
 def render_threat_feed():
@@ -1319,9 +1319,9 @@ def create_ai_anomaly_alerts(events):
 
 def render_ai_engine(report):
     render_page_heading("AI Engine")
-    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 10 seconds.")
+    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 5 seconds.")
 
-    @st.fragment(run_every="10s")
+    @st.fragment(run_every="5s")
     def live_panel():
         render_live_ai_panel()
 
@@ -1631,7 +1631,7 @@ def render_local_email_settings():
                 st.error(f"Could not save local email settings: {error}")
 
 
-@st.fragment(run_every="10s")
+@st.fragment(run_every="5s")
 def render_alert_system():
     render_page_heading("Alert System")
     severity_levels = ["Critical", "High", "Medium", "Low"]
