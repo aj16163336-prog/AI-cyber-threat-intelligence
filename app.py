@@ -4,10 +4,12 @@ from email.message import EmailMessage
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 import re
 import smtplib
 import sqlite3
+import tomllib
 from pathlib import Path
 
 import pandas as pd
@@ -27,6 +29,7 @@ from live_capture import capture_summary, list_interfaces
 BASE_DIR = Path(__file__).parent
 REPORT_PATH = BASE_DIR / "threat_report.csv"
 DATABASE_PATH = BASE_DIR / "security_center.db"
+LOCAL_EMAIL_SETTINGS_PATH = BASE_DIR / ".streamlit" / "email_settings.toml"
 FEODO_FEED_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.csv"
 VT_API_BASE = "https://www.virustotal.com/api/v3"
 FEED_COLUMNS = [
@@ -65,11 +68,34 @@ def connect_db():
 
 
 def setting(name, default=""):
+    if os.environ.get("CTI_DESKTOP_MODE") == "1" and LOCAL_EMAIL_SETTINGS_PATH.exists():
+        try:
+            local_settings = tomllib.loads(LOCAL_EMAIL_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if name in local_settings:
+                return str(local_settings[name] or "").strip()
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
     try:
         value = st.secrets.get(name, default)
     except Exception:
         value = default
     return str(value or os.environ.get(name, default)).strip()
+
+
+def save_local_email_settings(values):
+    """Persist SMTP settings only for the localhost desktop app, outside Git."""
+    if os.environ.get("CTI_DESKTOP_MODE") != "1":
+        raise RuntimeError("Local email settings can only be saved by the desktop app.")
+    allowed = {
+        "EMAIL_ALERTS_ENABLED", "ALERT_NOTIFY_MINIMUM", "SMTP_HOST", "SMTP_PORT",
+        "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM", "ALERT_EMAIL_TO",
+        "SMTP_USE_STARTTLS", "SMTP_USE_SSL",
+    }
+    if set(values) - allowed:
+        raise ValueError("Unexpected local email setting.")
+    LOCAL_EMAIL_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(f"{key} = {json.dumps(str(value))}" for key, value in values.items()) + "\n"
+    LOCAL_EMAIL_SETTINGS_PATH.write_text(content, encoding="utf-8")
 
 
 def apply_theme():
@@ -1510,6 +1536,60 @@ def map_signal_to_mitre(signal):
     return matches
 
 
+def render_local_email_settings():
+    """Let the local desktop app configure SMTP without editing a file by hand."""
+    if os.environ.get("CTI_DESKTOP_MODE") != "1":
+        return
+    current_enabled = setting("EMAIL_ALERTS_ENABLED", "false").lower() in {"1", "true", "yes"}
+    with st.expander("Configure desktop email alerts", expanded=not current_enabled):
+        st.caption("Settings stay on this computer and are not uploaded. The SMTP password is stored in a local, Git-ignored settings file; use an email app password where your provider supports it.")
+        with st.form("local_email_settings_form"):
+            enabled = st.checkbox("Enable email alerts", value=current_enabled)
+            threshold_options = ["Critical", "High", "Medium", "Low"]
+            current_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
+            threshold_index = threshold_options.index(current_threshold) if current_threshold in threshold_options else 1
+            st.selectbox("Minimum alert severity", threshold_options, index=threshold_index, key="local_email_threshold")
+            host = st.text_input("SMTP host", value=setting("SMTP_HOST"), placeholder="smtp.your-provider.com")
+            port = st.text_input("SMTP port", value=setting("SMTP_PORT", "587"))
+            username = st.text_input("SMTP username", value=setting("SMTP_USERNAME"))
+            saved_password = bool(setting("SMTP_PASSWORD"))
+            password = st.text_input("SMTP password or app password", type="password", help="Leave blank to keep the saved password." if saved_password else "Enter the password or app password for your SMTP account.")
+            if saved_password:
+                st.caption("A password is already saved locally; leave the password field blank to keep it.")
+            sender = st.text_input("From email", value=setting("SMTP_FROM", setting("SMTP_USERNAME")))
+            recipient = st.text_input("Alert recipient email", value=setting("ALERT_EMAIL_TO"))
+            starttls = st.checkbox("Use STARTTLS (usually port 587)", value=setting("SMTP_USE_STARTTLS", "true").lower() in {"1", "true", "yes"})
+            use_ssl = st.checkbox("Use SSL (usually port 465)", value=setting("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes"})
+            submitted = st.form_submit_button("Save local email settings")
+        if submitted:
+            try:
+                port_number = int(port.strip())
+                if not 1 <= port_number <= 65535:
+                    raise ValueError("SMTP port must be between 1 and 65535.")
+                if not all((host.strip(), sender.strip(), recipient.strip())):
+                    raise ValueError("Enter an SMTP host, sender address, and recipient address.")
+                effective_password = password or setting("SMTP_PASSWORD")
+                if bool(username.strip()) != bool(effective_password):
+                    raise ValueError("Enter both SMTP username and password, or leave both blank if the server does not require sign-in.")
+                save_local_email_settings({
+                    "EMAIL_ALERTS_ENABLED": "true" if enabled else "false",
+                    "ALERT_NOTIFY_MINIMUM": st.session_state.get("local_email_threshold", "High"),
+                    "SMTP_HOST": host.strip(),
+                    "SMTP_PORT": str(port_number),
+                    "SMTP_USERNAME": username.strip(),
+                    "SMTP_PASSWORD": effective_password,
+                    "SMTP_FROM": sender.strip(),
+                    "ALERT_EMAIL_TO": recipient.strip(),
+                    "SMTP_USE_STARTTLS": "true" if starttls else "false",
+                    "SMTP_USE_SSL": "true" if use_ssl else "false",
+                })
+                audit_event("local_email_settings_saved", "SMTP configuration updated on this computer")
+                st.success("Local email settings saved. You can now send a test email below.")
+                st.rerun()
+            except (OSError, ValueError, RuntimeError) as error:
+                st.error(f"Could not save local email settings: {error}")
+
+
 @st.fragment(run_every="10s")
 def render_alert_system():
     render_page_heading("Alert System")
@@ -1517,8 +1597,9 @@ def render_alert_system():
     configured_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
     default_index = severity_levels.index(configured_threshold) if configured_threshold in severity_levels else 1
     notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
+    render_local_email_settings()
     email_enabled = setting("EMAIL_ALERTS_ENABLED", "false").lower() in {"1", "true", "yes"}
-    if email_enabled:
+    if email_enabled and (os.environ.get("CTI_DESKTOP_MODE") != "1" or bool(setting("SMTP_HOST"))):
         st.success(f"Email notifications are enabled for alerts at or above {notification_minimum} severity.")
         if st.button("Send test email"):
             try:
@@ -1532,7 +1613,10 @@ def render_alert_system():
                 audit_event("email_alert_test_failed", str(error)[:300])
                 st.error(f"Test email failed: {error}")
     else:
-        st.info("Email notifications are off. Enable EMAIL_ALERTS_ENABLED and configure SMTP in your app's private Secrets, then restart/redeploy the app.")
+        if os.environ.get("CTI_DESKTOP_MODE") == "1":
+            st.info("Desktop email alerts are off. Open **Configure desktop email alerts** above and save your SMTP settings.")
+        else:
+            st.info("Email notifications are off. Enable EMAIL_ALERTS_ENABLED and configure SMTP in your app's private Secrets, then restart/redeploy the app.")
     st.caption("Every new alert at or above the selected level triggers an in-app notification and, when configured, an email. Repeated records are deduplicated by the alert engine.")
     try:
         endpoint_events, _ = load_sensor_events(limit=1000)

@@ -29,7 +29,7 @@ Requirements: Windows, Python, VS Code, and Npcap for packet capture. The endpoi
 pip install -r requirements.txt
 ```
 
-2. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set your own long, unique `APP_PASSWORD`. Keep `secrets.toml` private; it is ignored by Git. `VT_API_KEY` is optional and is required for VirusTotal domain/hash lookups. To enable email alerts, set `EMAIL_ALERTS_ENABLED = "true"`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM`, and `ALERT_EMAIL_TO`; add `SMTP_USERNAME` / `SMTP_PASSWORD` when your mail provider requires authentication. Use port 587 with `SMTP_USE_STARTTLS = "true"`, or port 465 with `SMTP_USE_SSL = "true"`. On Streamlit Cloud, add these values in the app's private Secrets settings, then restart/redeploy. Never commit real SMTP credentials. The Alert System includes a **Send test email** button to verify the configuration.
+2. Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and set your own long, unique `APP_PASSWORD`. Keep `secrets.toml` private; it is ignored by Git. `VT_API_KEY` is optional and is required for VirusTotal domain/hash lookups. In the desktop app, open **Alert System → Configure desktop email alerts** to save local SMTP settings; they are stored in an ignored local file and are not uploaded. Use port 587 with STARTTLS or port 465 with SSL. On Streamlit Cloud, set `EMAIL_ALERTS_ENABLED = "true"` and add SMTP values in the app's private Secrets settings. Never commit real SMTP credentials. The Alert System includes a **Send test email** button to verify the configuration.
 
 3. In one VS Code terminal, start the local endpoint sensor:
 

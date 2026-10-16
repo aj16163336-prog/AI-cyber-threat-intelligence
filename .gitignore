@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .env
 .streamlit/secrets.toml
+.streamlit/email_settings.toml
 security_center.db
 cti_backend.db
 *.db-wal
