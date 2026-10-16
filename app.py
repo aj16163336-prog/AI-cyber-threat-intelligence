@@ -10,6 +10,8 @@ import re
 import smtplib
 import sqlite3
 import tomllib
+import socket
+import ssl
 from pathlib import Path
 
 import pandas as pd
@@ -424,13 +426,38 @@ def notify_security_alert(severity, title):
 
 
 def send_security_email(subject, body):
-    """Send one email using SMTP settings supplied through private app secrets."""
-    host = setting("SMTP_HOST")
+    """Send email through a provider API or SMTP, using private settings."""
     recipient = setting("ALERT_EMAIL_TO")
     username, password = setting("SMTP_USERNAME"), setting("SMTP_PASSWORD")
     sender = setting("SMTP_FROM", username)
-    if not all((host, recipient, sender)):
-        raise ValueError("Email settings are incomplete. Configure SMTP_HOST, SMTP_FROM, and ALERT_EMAIL_TO in app Secrets.")
+    provider = setting("EMAIL_PROVIDER", "smtp").strip().lower()
+    if not all((recipient, sender)):
+        raise ValueError("Email settings are incomplete. Configure SMTP_FROM and ALERT_EMAIL_TO in app Secrets.")
+    if provider == "resend":
+        api_key = setting("RESEND_API_KEY")
+        if not api_key:
+            raise ValueError("EMAIL_PROVIDER is set to resend, but RESEND_API_KEY is missing from app Secrets.")
+        try:
+            response = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"from": sender, "to": [recipient], "subject": subject[:180], "text": body},
+                timeout=20,
+            )
+            if not response.ok:
+                try:
+                    error_message = response.json().get("message", "Email API rejected the request")
+                except (ValueError, AttributeError):
+                    error_message = "Email API rejected the request"
+                raise RuntimeError(f"Resend API returned HTTP {response.status_code}: {error_message}")
+        except requests.RequestException as error:
+            raise ConnectionError("Could not reach the Resend email API over HTTPS. Check the app's internet access and try again.") from error
+        return recipient
+    if provider != "smtp":
+        raise ValueError("EMAIL_PROVIDER must be either 'smtp' or 'resend'.")
+    host = setting("SMTP_HOST")
+    if not host:
+        raise ValueError("SMTP_HOST is missing from app Secrets.")
     try:
         port = int(setting("SMTP_PORT", "587"))
     except ValueError as error:
@@ -467,12 +494,21 @@ def send_security_email(subject, body):
                         raise ValueError("SMTP password is missing for the configured username.")
                     server.login(username, password)
                 server.send_message(message)
-    except (smtplib.SMTPServerDisconnected, TimeoutError, OSError) as error:
+    except (smtplib.SMTPServerDisconnected, TimeoutError, OSError, ssl.SSLError) as error:
         mode = "SSL" if use_ssl else "STARTTLS" if use_starttls else "plain SMTP"
+        if os.environ.get("CTI_DESKTOP_MODE") != "1":
+            guidance = (
+                "The hosted app's network may block outbound SMTP. Use the local desktop app with the endpoint sensor, "
+                "or configure an email delivery API such as Resend/SendGrid instead of Gmail SMTP."
+            )
+        else:
+            guidance = (
+                "Check that this network allows outbound SMTP. If port 587 is blocked, try port 465 with SSL only; "
+                "if both fail, try another trusted network or an email delivery API."
+            )
         raise ConnectionError(
             f"SMTP connection to {host}:{port} closed unexpectedly ({mode}). "
-            "Check the SMTP host and port, select SSL only for port 465 or STARTTLS for port 587, "
-            "and confirm your network/provider permits SMTP. For Gmail or Outlook, use an app password."
+            f"{guidance} For Gmail or Outlook, use an app password."
         ) from error
     return recipient
 
@@ -1668,7 +1704,11 @@ def render_alert_system():
     default_index = severity_levels.index(configured_threshold) if configured_threshold in severity_levels else 1
     notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
     render_local_email_settings()
-    configured_for_email = bool(setting("SMTP_HOST")) and bool(setting("ALERT_EMAIL_TO"))
+    email_provider = setting("EMAIL_PROVIDER", "smtp").strip().lower()
+    provider_ready = (
+        bool(setting("RESEND_API_KEY")) if email_provider == "resend" else bool(setting("SMTP_HOST"))
+    ) and bool(setting("ALERT_EMAIL_TO")) and bool(setting("SMTP_FROM"))
+    configured_for_email = provider_ready
     email_enabled = st.toggle(
         "Email notifications",
         key="email_alerts_enabled_this_session",
@@ -1678,8 +1718,8 @@ def render_alert_system():
     if configured_for_email:
         st.caption("Email notifications start OFF each session. Turn this on only when you want email alerts; restart or sign out to switch them off.")
     else:
-        st.caption("Configure SMTP first. Email notifications will be OFF by default and can be enabled for the current session here.")
-    if email_enabled and (os.environ.get("CTI_DESKTOP_MODE") != "1" or bool(setting("SMTP_HOST"))):
+        st.caption("Configure the selected email provider first. For Streamlit Cloud, Gmail SMTP may be blocked; use EMAIL_PROVIDER='resend' with a Resend API key. Email remains OFF by default.")
+    if email_enabled and configured_for_email:
         st.success(f"Email notifications are enabled for alerts at or above {notification_minimum} severity.")
         if st.button("Send test email"):
             try:
@@ -1692,6 +1732,12 @@ def render_alert_system():
             except Exception as error:
                 audit_event("email_alert_test_failed", str(error)[:300])
                 st.error(f"Test email failed: {error}")
+                if isinstance(error, (ConnectionError, OSError, TimeoutError, ssl.SSLError)):
+                    try:
+                        with socket.create_connection((setting("SMTP_HOST"), int(setting("SMTP_PORT", "587"))), timeout=4):
+                            st.caption("Network check: the SMTP port accepts a TCP connection; failure is occurring during SMTP/TLS negotiation or authentication.")
+                    except (OSError, ValueError) as network_error:
+                        st.caption(f"Network check: this environment cannot reach the configured SMTP host and port ({type(network_error).__name__}). This is usually a firewall or hosting-network restriction.")
     else:
         if os.environ.get("CTI_DESKTOP_MODE") == "1":
             st.info("Desktop email alerts are off. Open **Configure desktop email alerts** above and save your SMTP settings.")
