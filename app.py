@@ -429,21 +429,49 @@ def send_security_email(subject, body):
     sender = setting("SMTP_FROM", username)
     if not all((host, recipient, sender)):
         raise ValueError("Email settings are incomplete. Configure SMTP_HOST, SMTP_FROM, and ALERT_EMAIL_TO in app Secrets.")
-    port = int(setting("SMTP_PORT", "587"))
+    try:
+        port = int(setting("SMTP_PORT", "587"))
+    except ValueError as error:
+        raise ValueError("SMTP port must be 587 (STARTTLS) or 465 (SSL), unless your provider specifies another port.") from error
+    use_ssl = setting("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes"}
+    use_starttls = setting("SMTP_USE_STARTTLS", "true").lower() in {"1", "true", "yes"}
+    if use_ssl and use_starttls:
+        raise ValueError("Choose one secure mode: turn on SSL for port 465, or STARTTLS for port 587—not both.")
+    if port == 465:
+        use_ssl, use_starttls = True, False
+    elif port == 587:
+        use_ssl, use_starttls = False, True
     message = EmailMessage()
     message["Subject"] = subject[:180]
     message["From"] = sender
     message["To"] = recipient
     message.set_content(body)
-    smtp_class = smtplib.SMTP_SSL if setting("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes"} or port == 465 else smtplib.SMTP
-    with smtp_class(host, port, timeout=15) as server:
-        if smtp_class is smtplib.SMTP and setting("SMTP_USE_STARTTLS", "true").lower() in {"1", "true", "yes"}:
-            server.starttls()
-        if username:
-            if not password:
-                raise ValueError("SMTP_PASSWORD is missing for the configured SMTP_USERNAME.")
-            server.login(username, password)
-        server.send_message(message)
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=20) as server:
+                if username:
+                    if not password:
+                        raise ValueError("SMTP password is missing for the configured username.")
+                    server.login(username, password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as server:
+                server.ehlo()
+                if use_starttls:
+                    server.starttls()
+                    server.ehlo()
+                if username:
+                    if not password:
+                        raise ValueError("SMTP password is missing for the configured username.")
+                    server.login(username, password)
+                server.send_message(message)
+    except (smtplib.SMTPServerDisconnected, TimeoutError, OSError) as error:
+        mode = "SSL" if use_ssl else "STARTTLS" if use_starttls else "plain SMTP"
+        raise ConnectionError(
+            f"SMTP connection to {host}:{port} closed unexpectedly ({mode}). "
+            "Check the SMTP host and port, select SSL only for port 465 or STARTTLS for port 587, "
+            "and confirm your network/provider permits SMTP. For Gmail or Outlook, use an app password."
+        ) from error
     return recipient
 
 
@@ -1601,6 +1629,7 @@ def render_local_email_settings():
             recipient = st.text_input("Alert recipient email", value=setting("ALERT_EMAIL_TO"))
             starttls = st.checkbox("Use STARTTLS (usually port 587)", value=setting("SMTP_USE_STARTTLS", "true").lower() in {"1", "true", "yes"})
             use_ssl = st.checkbox("Use SSL (usually port 465)", value=setting("SMTP_USE_SSL", "false").lower() in {"1", "true", "yes"})
+            st.caption("Common settings: Gmail → smtp.gmail.com, port 587, STARTTLS; Outlook → smtp.office365.com, port 587, STARTTLS. For port 465, choose SSL and turn STARTTLS off.")
             submitted = st.form_submit_button("Save local email settings")
         if submitted:
             try:
