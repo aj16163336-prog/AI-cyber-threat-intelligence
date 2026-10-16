@@ -68,6 +68,8 @@ def connect_db():
 
 
 def setting(name, default=""):
+    if name == "EMAIL_ALERTS_ENABLED":
+        return "false"
     if os.environ.get("CTI_DESKTOP_MODE") == "1" and LOCAL_EMAIL_SETTINGS_PATH.exists():
         try:
             local_settings = tomllib.loads(LOCAL_EMAIL_SETTINGS_PATH.read_text(encoding="utf-8"))
@@ -1609,11 +1611,9 @@ def render_local_email_settings():
     """Let the local desktop app configure SMTP without editing a file by hand."""
     if os.environ.get("CTI_DESKTOP_MODE") != "1":
         return
-    current_enabled = setting("EMAIL_ALERTS_ENABLED", "false").lower() in {"1", "true", "yes"}
-    with st.expander("Configure desktop email alerts", expanded=not current_enabled):
+    with st.expander("Configure desktop email alerts", expanded=False):
         st.caption("Settings stay on this computer and are not uploaded. The SMTP password is stored in a local, Git-ignored settings file; use an email app password where your provider supports it.")
         with st.form("local_email_settings_form"):
-            enabled = st.checkbox("Enable email alerts", value=current_enabled)
             threshold_options = ["Critical", "High", "Medium", "Low"]
             current_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
             threshold_index = threshold_options.index(current_threshold) if current_threshold in threshold_options else 1
@@ -1642,7 +1642,7 @@ def render_local_email_settings():
                 if bool(username.strip()) != bool(effective_password):
                     raise ValueError("Enter both SMTP username and password, or leave both blank if the server does not require sign-in.")
                 save_local_email_settings({
-                    "EMAIL_ALERTS_ENABLED": "true" if enabled else "false",
+                    "EMAIL_ALERTS_ENABLED": "false",
                     "ALERT_NOTIFY_MINIMUM": st.session_state.get("local_email_threshold", "High"),
                     "SMTP_HOST": host.strip(),
                     "SMTP_PORT": str(port_number),
@@ -1654,7 +1654,7 @@ def render_local_email_settings():
                     "SMTP_USE_SSL": "true" if use_ssl else "false",
                 })
                 audit_event("local_email_settings_saved", "SMTP configuration updated on this computer")
-                st.success("Local email settings saved. You can now send a test email below.")
+                st.success("SMTP settings saved locally. Use the Email notifications switch above when you want alerts.")
                 st.rerun()
             except (OSError, ValueError, RuntimeError) as error:
                 st.error(f"Could not save local email settings: {error}")
@@ -1668,7 +1668,17 @@ def render_alert_system():
     default_index = severity_levels.index(configured_threshold) if configured_threshold in severity_levels else 1
     notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
     render_local_email_settings()
-    email_enabled = setting("EMAIL_ALERTS_ENABLED", "false").lower() in {"1", "true", "yes"}
+    configured_for_email = bool(setting("SMTP_HOST")) and bool(setting("ALERT_EMAIL_TO"))
+    email_enabled = st.toggle(
+        "Email notifications",
+        key="email_alerts_enabled_this_session",
+        disabled=not configured_for_email,
+        help="This switch resets to OFF whenever you restart the app or sign in again.",
+    )
+    if configured_for_email:
+        st.caption("Email notifications start OFF each session. Turn this on only when you want email alerts; restart or sign out to switch them off.")
+    else:
+        st.caption("Configure SMTP first. Email notifications will be OFF by default and can be enabled for the current session here.")
     if email_enabled and (os.environ.get("CTI_DESKTOP_MODE") != "1" or bool(setting("SMTP_HOST"))):
         st.success(f"Email notifications are enabled for alerts at or above {notification_minimum} severity.")
         if st.button("Send test email"):
@@ -1987,6 +1997,8 @@ def main():
 
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
+    if not st.session_state["authenticated"]:
+        st.session_state["email_alerts_enabled_this_session"] = False
 
     if not st.session_state["authenticated"]:
         intro, access = st.columns([1.1, 0.9], gap="large")
@@ -2052,6 +2064,7 @@ def main():
     if st.sidebar.button("Log out", width="stretch"):
         audit_event("logout", "User signed out.")
         st.session_state["authenticated"] = False
+        st.session_state["email_alerts_enabled_this_session"] = False
         st.session_state.pop("username", None)
         st.rerun()
 
