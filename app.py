@@ -1284,9 +1284,9 @@ def create_ai_anomaly_alerts(events):
 
 def render_ai_engine(report):
     render_page_heading("AI Engine")
-    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 20 seconds.")
+    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 10 seconds.")
 
-    @st.fragment(run_every="20s")
+    @st.fragment(run_every="10s")
     def live_panel():
         render_live_ai_panel()
 
@@ -1305,7 +1305,7 @@ def render_explainable_ai_assistant():
     st.write("Select a live endpoint event to see the exact signals behind its risk score and suggested analyst checks.")
     st.caption("This assistant explains the sensor and model evidence available in the event; it does not invent conclusions or label the score as a probability.")
 
-    @st.fragment(run_every="20s")
+    @st.fragment(run_every="10s")
     def assistant_panel():
         render_live_ai_panel(show_assistant=True)
 
@@ -1596,7 +1596,7 @@ def render_local_email_settings():
                 st.error(f"Could not save local email settings: {error}")
 
 
-@st.fragment(run_every="20s")
+@st.fragment(run_every="10s")
 def render_alert_system():
     render_page_heading("Alert System")
     severity_levels = ["Critical", "High", "Medium", "Low"]
