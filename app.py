@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
 from email.message import EmailMessage
+from email.utils import parseaddr
 import hashlib
 import hmac
 import ipaddress
@@ -429,10 +430,16 @@ def send_security_email(subject, body):
     """Send email through a provider API or SMTP, using private settings."""
     recipient = setting("ALERT_EMAIL_TO")
     username, password = setting("SMTP_USERNAME"), setting("SMTP_PASSWORD")
-    sender = setting("SMTP_FROM", username)
     provider = setting("EMAIL_PROVIDER", "smtp").strip().lower()
+    sender = setting("RESEND_FROM", setting("SMTP_FROM", username)) if provider == "resend" else setting("SMTP_FROM", username)
     if not all((recipient, sender)):
         raise ValueError("Email settings are incomplete. Configure SMTP_FROM and ALERT_EMAIL_TO in app Secrets.")
+    parsed_sender = parseaddr(sender)[1]
+    parsed_recipient = parseaddr(recipient)[1]
+    if "@" not in parsed_sender or "." not in parsed_sender.rsplit("@", 1)[-1]:
+        raise ValueError("Set a valid sender email address. Resend requires a verified sender domain for regular delivery.")
+    if "@" not in parsed_recipient or "." not in parsed_recipient.rsplit("@", 1)[-1]:
+        raise ValueError("Set a real alert recipient email address in ALERT_EMAIL_TO.")
     if provider == "resend":
         api_key = setting("RESEND_API_KEY")
         if not api_key:
@@ -1705,9 +1712,14 @@ def render_alert_system():
     notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
     render_local_email_settings()
     email_provider = setting("EMAIL_PROVIDER", "smtp").strip().lower()
+    sender_setting = setting("RESEND_FROM", setting("SMTP_FROM")) if email_provider == "resend" else setting("SMTP_FROM")
+    sender_address = parseaddr(sender_setting)[1]
+    recipient_address = parseaddr(setting("ALERT_EMAIL_TO"))[1]
+    sender_valid = "@" in sender_address and "." in sender_address.rsplit("@", 1)[-1]
+    recipient_valid = "@" in recipient_address and "." in recipient_address.rsplit("@", 1)[-1]
     provider_ready = (
         bool(setting("RESEND_API_KEY")) if email_provider == "resend" else bool(setting("SMTP_HOST"))
-    ) and bool(setting("ALERT_EMAIL_TO")) and bool(setting("SMTP_FROM"))
+    ) and sender_valid and recipient_valid
     configured_for_email = provider_ready
     email_enabled = st.toggle(
         "Email notifications",
