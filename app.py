@@ -535,6 +535,7 @@ def load_report():
     return pd.DataFrame()
 
 
+@st.cache_data(ttl=3, show_spinner=False)
 def load_sensor_events(limit=500):
     """Read endpoint events from the cloud API, or local sensor database."""
     api_url = setting("API_BASE_URL").rstrip("/")
@@ -857,8 +858,8 @@ def render_endpoint_security():
     if os.environ.get("CTI_DESKTOP_MODE") == "1":
         st.info(
             "The local sensor starts automatically with this desktop app and runs "
-            "in the background. Return here and select `Refresh events` to see new "
-            "file, process, and connection events."
+            "in the background. New file, process, and connection events appear "
+            "when you revisit this page or choose `Refresh events`."
         )
     else:
         st.info(
@@ -871,6 +872,10 @@ def render_endpoint_security():
     except Exception as error:
         st.error(f"Could not load sensor events: {error}")
         return
+
+    if st.button("Refresh events", key="refresh_endpoint_events"):
+        load_sensor_events.clear()
+        st.rerun()
 
     st.caption("Event source: " + ("deployed API" if source == "cloud" else "this computer"))
     if events.empty:
@@ -1093,11 +1098,12 @@ def live_event_features(events):
     return frame.astype(float)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def analyze_live_events(events, model_minimum=20):
     events = events.copy()
     features = live_event_features(events)
     if len(events) >= model_minimum:
-        model = IsolationForest(n_estimators=100, contamination="auto", random_state=42)
+        model = IsolationForest(n_estimators=40, contamination="auto", random_state=42, n_jobs=1)
         predictions = model.fit_predict(features)
         decision = model.decision_function(features)
         events["AI anomaly"] = predictions == -1
@@ -1150,9 +1156,9 @@ def analyze_live_events(events, model_minimum=20):
 
 
 def render_live_ai_panel(show_assistant=False):
-    """Refresh endpoint events and run a rolling Isolation Forest every 10 seconds."""
+    """Refresh endpoint events and run a cached rolling Isolation Forest."""
     try:
-        events, source = load_sensor_events(limit=1000)
+        events, source = load_sensor_events(limit=500)
     except Exception as error:
         st.error(f"Live endpoint events could not be loaded: {error}")
         return
@@ -1178,7 +1184,7 @@ def render_live_ai_panel(show_assistant=False):
     st.caption(f"Live model: {model_label}. The anomaly score is a relative ranking within this window, not a malware probability or verdict.")
 
     display_columns = [column for column in [occurred_col, "event_type", "AI severity", "AI risk score", "AI anomaly", "AI anomaly score", "AI indicators", "process_name", "remote_ip", "summary"] if column in events]
-    st.dataframe(events[display_columns].head(100), hide_index=True, width="stretch")
+    st.dataframe(events[display_columns].head(50), hide_index=True, width="stretch")
     anomalies = events[events["AI anomaly"]]
     if not anomalies.empty:
         if st.button("Create review alerts for AI anomalies", key="create_ai_anomaly_alerts"):
@@ -1187,7 +1193,7 @@ def render_live_ai_panel(show_assistant=False):
     if show_assistant:
         st.subheader("Explainable AI Assistant")
         event_options = {}
-        for position, (index, row) in enumerate(events.iterrows(), start=1):
+        for position, (index, row) in enumerate(events.head(100).iterrows(), start=1):
             identity = row.get("event_id")
             if identity is None or pd.isna(identity) or not str(identity).strip():
                 identity = row.get("event_uid")
@@ -1278,9 +1284,9 @@ def create_ai_anomaly_alerts(events):
 
 def render_ai_engine(report):
     render_page_heading("AI Engine")
-    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 10 seconds.")
+    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 20 seconds.")
 
-    @st.fragment(run_every="10s")
+    @st.fragment(run_every="20s")
     def live_panel():
         render_live_ai_panel()
 
@@ -1299,7 +1305,7 @@ def render_explainable_ai_assistant():
     st.write("Select a live endpoint event to see the exact signals behind its risk score and suggested analyst checks.")
     st.caption("This assistant explains the sensor and model evidence available in the event; it does not invent conclusions or label the score as a probability.")
 
-    @st.fragment(run_every="10s")
+    @st.fragment(run_every="20s")
     def assistant_panel():
         render_live_ai_panel(show_assistant=True)
 
@@ -1590,7 +1596,7 @@ def render_local_email_settings():
                 st.error(f"Could not save local email settings: {error}")
 
 
-@st.fragment(run_every="10s")
+@st.fragment(run_every="20s")
 def render_alert_system():
     render_page_heading("Alert System")
     severity_levels = ["Critical", "High", "Medium", "Low"]

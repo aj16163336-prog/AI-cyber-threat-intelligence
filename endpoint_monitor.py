@@ -16,6 +16,7 @@ from pathlib import Path
 import sqlite3
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 import winreg
 
@@ -45,9 +46,10 @@ SUSPICIOUS_EXTENSIONS = {
     ".vbs", ".vbe", ".js", ".jse", ".hta", ".lnk", ".reg", ".jar",
     ".docm", ".xlsm", ".iso", ".img",
 }
+IGNORED_PATH_PARTS = {".venv", ".git", "__pycache__"}
 MAX_HASH_BYTES = 100 * 1024 * 1024
-POLL_SECONDS = 5
-APP_SCAN_SECONDS = 30
+POLL_SECONDS = 10
+APP_SCAN_SECONDS = 120
 FEODO_FEED_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.csv"
 _feed_expires = 0.0
 _feodo_ips = set()
@@ -259,6 +261,18 @@ def wait_until_stable(path: Path, timeout=12):
 
 
 class FileEvents(FileSystemEventHandler):
+    def __init__(self, file_workers):
+        self.file_workers = file_workers
+
+    def _queue(self, value, kind):
+        path = Path(value)
+        if any(part.casefold() in IGNORED_PATH_PARTS for part in path.parts):
+            return
+        try:
+            self.file_workers.submit(self._record, str(path), kind)
+        except RuntimeError:
+            pass
+
     def _record(self, value, kind):
         path = Path(value)
         if not path.is_file():
@@ -284,18 +298,19 @@ class FileEvents(FileSystemEventHandler):
                 if flagged else "File metadata and SHA-256 recorded locally; no malware verdict."
             ),
         )
+        print(f"Detected {kind} file: {path.name} [{severity}]")
 
     def on_created(self, event):
         if not event.is_directory:
-            self._record(event.src_path, "created")
+            self._queue(event.src_path, "created")
 
     def on_moved(self, event):
         if not event.is_directory:
-            self._record(event.dest_path, "moved_into")
+            self._queue(event.dest_path, "moved_into")
 
     def on_modified(self, event):
         if not event.is_directory:
-            self._record(event.src_path, "modified")
+            self._queue(event.src_path, "modified")
 
 
 def process_key(process):
@@ -308,14 +323,17 @@ def process_key(process):
 def process_snapshot():
     found = {}
     for proc in psutil.process_iter(["pid", "name", "exe", "create_time"]):
-        key = process_key(proc)
-        if key is None:
+        try:
+            key = process_key(proc)
+            if key is None:
+                continue
+            found[key] = {
+                "pid": key[0],
+                "name": proc.info.get("name") or "unknown",
+                "exe": proc.info.get("exe") or "",
+            }
+        except (psutil.Error, OSError):
             continue
-        found[key] = {
-            "pid": key[0],
-            "name": proc.info.get("name") or "unknown",
-            "exe": proc.info.get("exe") or "",
-        }
     return found
 
 
@@ -468,7 +486,8 @@ def observe_connections(seen, bad_ips):
 def run_sensor():
     init_db()
     observer = Observer()
-    handler = FileEvents()
+    file_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cti-file")
+    handler = FileEvents(file_workers)
     watched = []
     for folder in WATCH_PATHS:
         if folder.is_dir():
@@ -508,6 +527,7 @@ def run_sensor():
     finally:
         observer.stop()
         observer.join(timeout=5)
+        file_workers.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
