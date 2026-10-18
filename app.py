@@ -362,6 +362,9 @@ def init_database():
             "ON alerts(source_event_id)"
         )
         connection.execute(
+            "CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -397,6 +400,42 @@ def load_alerts():
         return pd.read_sql_query(
             "SELECT * FROM alerts ORDER BY id DESC", connection
         )
+
+
+def hide_cleared_notifications(alerts):
+    """Hide active alerts created before the last clear-all action, while retaining history."""
+    if alerts.empty or "created_at" not in alerts.columns:
+        return alerts
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT value FROM app_state WHERE key = 'notifications_cleared_at'"
+        ).fetchone()
+    if not row:
+        return alerts
+    cleared_at = pd.to_datetime(row[0], utc=True, errors="coerce")
+    if pd.isna(cleared_at):
+        return alerts
+    active = alerts["status"].isin(["Open", "Acknowledged"])
+    created = pd.to_datetime(alerts["created_at"], utc=True, errors="coerce")
+    keep = ~active | (created > cleared_at)
+    return alerts.loc[keep].copy()
+
+
+def clear_all_notifications():
+    """Close current active alerts and set a cutoff so old events cannot repopulate the inbox."""
+    cleared_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    with connect_db() as connection:
+        cursor = connection.execute(
+            "UPDATE alerts SET status = 'Closed' WHERE status IN ('Open', 'Acknowledged')"
+        )
+        connection.execute(
+            "INSERT INTO app_state (key, value) VALUES ('notifications_cleared_at', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (cleared_at,),
+        )
+    count = max(int(cursor.rowcount), 0)
+    audit_event("alerts_cleared_in_bulk", f"count={count}; status=Closed")
+    return count
 
 
 def load_incidents():
@@ -717,10 +756,27 @@ def sensor_health_status(events, source):
 @st.fragment(run_every="5s")
 def render_dashboard_alert_inbox():
     """Show persistent in-app alerts and let the analyst acknowledge one quickly."""
-    alerts = load_alerts()
+    alerts = hide_cleared_notifications(load_alerts())
     open_alerts = alerts[alerts["status"] == "Open"] if not alerts.empty else alerts
     active_alerts = alerts[alerts["status"].isin(["Open", "Acknowledged"])] if not alerts.empty else alerts
     st.markdown('<div class="cti-section-label">In-app alert inbox</div>', unsafe_allow_html=True)
+    controls = st.columns([3, 1])
+    with controls[1]:
+        if st.button(
+            "Clear all",
+            key="dashboard_clear_all_notifications",
+            disabled=active_alerts.empty,
+            type="secondary",
+            width="stretch",
+        ):
+            cleared_count = clear_all_notifications()
+            st.session_state["notifications_cleared_message"] = (
+                f"Cleared {cleared_count} notification(s). New alerts will still appear."
+            )
+            st.rerun()
+    cleared_message = st.session_state.pop("notifications_cleared_message", None)
+    if cleared_message:
+        st.success(cleared_message)
     if active_alerts.empty:
         st.caption("No active in-app alerts. New alerts will appear here and in the Alert System.")
         return
@@ -1852,7 +1908,10 @@ def render_alert_system():
     except Exception as error:
         st.warning(f"Could not check live endpoint events: {error}")
 
-    alerts = load_alerts()
+    alerts = hide_cleared_notifications(load_alerts())
+    cleared_message = st.session_state.pop("notifications_cleared_message", None)
+    if cleared_message:
+        st.success(cleared_message)
     if alerts.empty:
         st.info(
             "No alerts have been recorded. Endpoint events marked Review, High, or Critical "
@@ -1861,14 +1920,11 @@ def render_alert_system():
         return
 
     active_count = int(alerts["status"].isin(["Open", "Acknowledged"]).sum())
-    if st.button("Clear all active alerts", disabled=active_count == 0, type="secondary"):
-        with connect_db() as connection:
-            cursor = connection.execute(
-                "UPDATE alerts SET status = 'Closed' WHERE status IN ('Open', 'Acknowledged')"
-            )
-        cleared_count = max(int(cursor.rowcount), 0)
-        audit_event("alerts_cleared_in_bulk", f"count={cleared_count}; status=Closed")
-        st.success(f"Cleared {cleared_count} active alert(s). They are marked Closed and remain in the alert history.")
+    if st.button("Clear all notifications", disabled=active_count == 0, type="secondary"):
+        cleared_count = clear_all_notifications()
+        st.session_state["notifications_cleared_message"] = (
+            f"Cleared {cleared_count} notification(s). New alerts will still appear."
+        )
         st.rerun()
 
     severity_order = ["Critical", "High", "Medium", "Low"]
