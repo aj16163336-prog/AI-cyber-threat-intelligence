@@ -27,6 +27,13 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestClassifier
 
+from ai_copilot import (
+    AICopilotError,
+    DEFAULT_MODEL as DEFAULT_OPENAI_MODEL,
+    build_event_context,
+    build_evaluation_context,
+    generate_review,
+)
 from live_capture import capture_summary, list_interfaces
 
 BASE_DIR = Path(__file__).parent
@@ -93,6 +100,49 @@ def setting(name, default=""):
     except Exception:
         value = default
     return str(value or os.environ.get(name, default)).strip()
+
+
+def render_optional_ai_review(*, payload, review_type, key_suffix, disclosure):
+    """Render a manual, consent-gated generative AI review for bounded context."""
+    api_key = setting("OPENAI_API_KEY")
+    model = setting("OPENAI_MODEL", DEFAULT_OPENAI_MODEL) or DEFAULT_OPENAI_MODEL
+    with st.expander("Generative AI review (optional)"):
+        st.caption(disclosure)
+        if not api_key:
+            st.info(
+                "Add `OPENAI_API_KEY` to local `.streamlit/secrets.toml` or your "
+                "Streamlit Cloud app's private Secrets. ChatGPT sign-in is not an API key. "
+                "API usage may be billed separately."
+            )
+            return
+
+        context_json = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        context_digest = hashlib.sha256(context_json.encode("utf-8")).hexdigest()
+        state_key = f"openai_review_{review_type}_{key_suffix}"
+        result_key = f"openai_review_result_{review_type}_{key_suffix}"
+        consent = st.checkbox(
+            "I understand and allow sending the data described above to OpenAI for this review.",
+            value=False,
+            key=state_key,
+        )
+        if consent and st.button("Generate AI review", key=f"openai_review_button_{review_type}_{key_suffix}"):
+            try:
+                with st.spinner("Requesting a one-time AI review..."):
+                    answer = generate_review(
+                        payload=payload,
+                        api_key=api_key,
+                        model=model,
+                        review_type=review_type,
+                    )
+                st.session_state[result_key] = {"digest": context_digest, "text": answer}
+                audit_event("openai_ai_review_generated", f"type={review_type}; model={model}")
+            except AICopilotError as error:
+                st.error(str(error))
+        saved = st.session_state.get(result_key, {})
+        if saved.get("digest") == context_digest:
+            st.markdown("**AI-generated analyst aid**")
+            st.markdown(saved.get("text", ""))
+            st.caption("Advisory only. Verify the evidence and conclusions before acting.")
 
 
 def save_local_email_settings(values):
@@ -1641,6 +1691,30 @@ def render_live_ai_panel(show_assistant=False):
         else:
             next_steps = "Compare related events and timestamps, then document the analyst's conclusion in Incident Management."
         st.info("**Suggested investigation:** " + next_steps)
+        event_context = build_event_context(selected.to_dict())
+        mitre_signal = " ".join([event_context["event_type"], *event_context["rule_indicators"]])
+        event_context["candidate_mitre_techniques"] = [
+            {
+                "technique_id": item["Technique ID"],
+                "technique": item["Technique"],
+                "mapping_rationale": item["Mapping rationale"],
+            }
+            for item in map_signal_to_mitre(mitre_signal)
+        ][:8]
+        event_context_id = hashlib.sha256(
+            json.dumps(event_context, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        ).hexdigest()[:12]
+        render_optional_ai_review(
+            payload=event_context,
+            review_type="event",
+            key_suffix=event_context_id,
+            disclosure=(
+                "Only this event's type and timestamp, severity and risk scores, anomaly/IOC flags, "
+                "rule-generated reasons, possible ATT&CK technique IDs/rationales, process name, and remote IP/port are sent after you check "
+                "consent and click Generate. File contents, full paths, file hashes, and arbitrary "
+                "event text are excluded. The request uses OpenAI's Responses API with storage disabled."
+            ),
+        )
     if len(events) < model_minimum:
         st.info("The live ML model starts after 20 endpoint events. Until then, the table shows sensor detections and IOC matches without inventing AI results.")
 
@@ -1892,6 +1966,21 @@ def render_model_evaluation_lab():
         st.dataframe(result["confusion"], width="stretch")
     st.subheader("Most influential features")
     st.bar_chart(result["top_features"].set_index("Feature"), color="#CEDE62")
+    evaluation_context = build_evaluation_context(result, target, source)
+    evaluation_context_id = hashlib.sha256(
+        json.dumps(evaluation_context, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:12]
+    render_optional_ai_review(
+        payload=evaluation_context,
+        review_type="evaluation",
+        key_suffix=evaluation_context_id,
+        disclosure=(
+            "Only aggregate accuracy/F1 metrics, class names and per-class scores, row counts, "
+            "dataset/target labels, and the top feature names/importances are sent after you check "
+            "consent and click Generate. No CSV rows, raw samples, or file contents are sent. "
+            "Avoid sensitive class or feature names in uploaded datasets."
+        ),
+    )
     metrics_export = pd.DataFrame([
         {"Metric": "Accuracy", "Value": result["accuracy"]},
         {"Metric": "Balanced accuracy", "Value": result["balanced_accuracy"]},
