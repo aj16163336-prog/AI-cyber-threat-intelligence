@@ -434,6 +434,9 @@ def clear_all_notifications():
             (cleared_at,),
         )
     count = max(int(cursor.rowcount), 0)
+    # Keep the Alert System focused on active items after clearing, even if the user
+    # previously selected Closed/Resolved in its status filter.
+    st.session_state["alert_status_filter"] = ["Open", "Acknowledged"]
     audit_event("alerts_cleared_in_bulk", f"count={count}; status=Closed")
     return count
 
@@ -1929,7 +1932,12 @@ def render_alert_system():
 
     severity_order = ["Critical", "High", "Medium", "Low"]
     chosen_severities = st.multiselect("Filter severity", severity_order, default=severity_order)
-    chosen_statuses = st.multiselect("Filter status", ["Open", "Acknowledged", "Closed", "Resolved"], default=["Open", "Acknowledged"])
+    chosen_statuses = st.multiselect(
+        "Filter status",
+        ["Open", "Acknowledged", "Closed", "Resolved"],
+        default=["Open", "Acknowledged"],
+        key="alert_status_filter",
+    )
     visible = alerts[alerts["severity"].isin(chosen_severities) & alerts["status"].isin(chosen_statuses)]
     st.dataframe(visible, hide_index=True, width="stretch")
     if visible.empty:
