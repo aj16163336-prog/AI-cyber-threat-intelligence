@@ -35,6 +35,14 @@ DATABASE_PATH = BASE_DIR / "security_center.db"
 LOCAL_EMAIL_SETTINGS_PATH = BASE_DIR / ".streamlit" / "email_settings.toml"
 FEODO_FEED_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.csv"
 VT_API_BASE = "https://www.virustotal.com/api/v3"
+ABUSEIPDB_CHECK_URL = "https://api.abuseipdb.com/api/v2/check"
+ALERT_CHECKLIST_ITEMS = (
+    ("validate_context", "Verify the event time, affected host, account, and process."),
+    ("correlate_activity", "Review nearby events and related alerts for the same host or indicator."),
+    ("check_reputation", "Check relevant IPs, domains, and file hashes in IOC Analysis."),
+    ("contain_if_confirmed", "If the threat is confirmed, follow your approved process to contain the host or block the indicator."),
+    ("document_decision", "Record evidence and the investigation outcome before updating the alert status."),
+)
 FEED_COLUMNS = [
     "first_seen_utc",
     "dst_ip",
@@ -365,6 +373,16 @@ def init_database():
             "CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS alert_checklist (
+                alert_id INTEGER NOT NULL,
+                item_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (alert_id, item_key)
+            )"""
+        )
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -562,22 +580,60 @@ def send_security_email(subject, body):
     return recipient
 
 
-def add_alert(title, severity, details, mitre_id=""):
+def add_alert(title, severity, details, mitre_id="", source_event_id=None):
     with connect_db() as connection:
-        connection.execute(
-            """INSERT INTO alerts
-               (created_at, title, severity, details, mitre_id, status)
-               VALUES (?, ?, ?, ?, ?, 'Open')""",
-            (
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                title,
-                severity,
-                details,
-                mitre_id,
-            ),
-        )
+        created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if source_event_id:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO alerts
+                   (created_at, title, severity, details, mitre_id, source_event_id, status)
+                   VALUES (?, ?, ?, ?, ?, ?, 'Open')""",
+                (created_at, title, severity, details, mitre_id, source_event_id),
+            )
+            if cursor.rowcount == 0:
+                return False
+        else:
+            connection.execute(
+                """INSERT INTO alerts
+                   (created_at, title, severity, details, mitre_id, status)
+                   VALUES (?, ?, ?, ?, ?, 'Open')""",
+                (created_at, title, severity, details, mitre_id),
+            )
     audit_event("alert_created", f"severity={severity}; title={title[:150]}")
     notify_security_alert(severity, title)
+    return True
+
+
+def load_alert_checklist(alert_id):
+    """Create and load the standard investigation checklist for one alert."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect_db() as connection:
+        connection.executemany(
+            """INSERT OR IGNORE INTO alert_checklist
+               (alert_id, item_key, label, completed, updated_at)
+               VALUES (?, ?, ?, 0, ?)""",
+            [(int(alert_id), key, label, now) for key, label in ALERT_CHECKLIST_ITEMS],
+        )
+        return pd.read_sql_query(
+            "SELECT item_key, label, completed FROM alert_checklist "
+            "WHERE alert_id = ? ORDER BY rowid",
+            connection,
+            params=(int(alert_id),),
+        )
+
+
+def save_alert_checklist(alert_id, checked_items):
+    """Persist analyst checklist progress for one alert."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect_db() as connection:
+        connection.executemany(
+            """UPDATE alert_checklist SET completed = ?, updated_at = ?
+               WHERE alert_id = ? AND item_key = ?""",
+            [
+                (int(bool(checked)), now, int(alert_id), item_key)
+                for item_key, checked in checked_items.items()
+            ],
+        )
 
 
 def sync_endpoint_alerts(events):
@@ -1183,39 +1239,57 @@ def render_threat_feed():
 def render_ioc_analysis():
     render_page_heading("IOC Analysis")
     st.write("Check an IP, domain, or file hash against available reputation sources.")
-    ioc_type = st.selectbox("Indicator type", ["IP address", "Domain", "File hash (MD5 / SHA-1 / SHA-256)"])
-    placeholder = {"IP address": "203.0.113.10", "Domain": "example.org", "File hash (MD5 / SHA-1 / SHA-256)": "Paste a file hash; do not upload the file"}[ioc_type]
+    ioc_type = st.selectbox(
+        "Indicator type",
+        ["IP address", "Domain", "File hash (MD5 / SHA-1 / SHA-256)"],
+    )
+    placeholder = {
+        "IP address": "203.0.113.10",
+        "Domain": "example.org",
+        "File hash (MD5 / SHA-1 / SHA-256)": "Paste a file hash; do not upload the file",
+    }[ioc_type]
     ioc_text = st.text_input("Indicator", placeholder=placeholder)
     vt_key = setting("VT_API_KEY")
-    st.caption("VirusTotal API key is optional. The indicator text is sent to VirusTotal only when you select Check IOC and a key is configured. File contents are never uploaded.")
+    abuseipdb_key = setting("ABUSEIPDB_API_KEY")
+    available_sources = []
+    if vt_key:
+        available_sources.append("VirusTotal")
+    if ioc_type == "IP address":
+        if abuseipdb_key:
+            available_sources.append("AbuseIPDB")
+        available_sources.append("Feodo Tracker")
+    st.caption(
+        "Add VT_API_KEY and/or ABUSEIPDB_API_KEY to the app's private Secrets to enable those lookups. "
+        "Only sources selected below receive the indicator when you press Check IOC; file contents are never uploaded."
+    )
+    if "VirusTotal" in available_sources:
+        st.warning(
+            "VirusTotal may add queried indicators to its shared dataset. Do not check confidential, "
+            "sensitive, or personally identifying indicators there."
+        )
+    if ioc_type != "IP address" and not vt_key:
+        st.info("VirusTotal is the supported reputation source for domains and hashes. Add VT_API_KEY to private Secrets to enable it.")
+    selected_sources = st.multiselect(
+        "Reputation sources",
+        available_sources,
+        default=available_sources,
+        key=f"ioc_sources_{ioc_type}",
+        help="Choose which providers receive this indicator. Feodo Tracker compares IPs against its public feed.",
+    )
     if st.button("Check IOC", type="primary"):
         try:
             value = ioc_text.strip()
             if not value:
                 st.error("Enter an indicator first.")
                 return
+            if not selected_sources:
+                st.error("Select at least one available reputation source.")
+                return
             if ioc_type == "IP address":
                 address = ipaddress.ip_address(value)
                 normalized = str(address)
-                if vt_key:
-                    result = query_virustotal("ip_addresses", normalized, vt_key)
-                    show_virustotal_result(result, normalized)
-                else:
-                    if address.version != 4:
-                        st.info("Feodo Tracker fallback supports IPv4 only. Configure VT_API_KEY for IPv6 reputation checks.")
-                        return
-                    feed = load_feodo_feed()
-                    matches = feed[feed["dst_ip"] == normalized] if not feed.empty else pd.DataFrame()
-                    if matches.empty:
-                        st.success("No match for this IP was found in the current Feodo Tracker feed.")
-                    else:
-                        st.error("Feodo Tracker match found. Review this indicator before taking action.")
-                        st.dataframe(matches, hide_index=True, width="stretch")
-                        add_alert("IOC match from manual analysis", "High", f"IPv4 {normalized} matched {len(matches)} Feodo Tracker record(s).")
+                endpoint = "ip_addresses"
             else:
-                if not vt_key:
-                    st.warning("Configure VT_API_KEY in app Secrets to check domains and hashes with VirusTotal.")
-                    return
                 if ioc_type == "Domain":
                     normalized = value.rstrip(".").lower()
                     if len(normalized) > 253 or not all(part and len(part) <= 63 and re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", part) for part in normalized.split(".")):
@@ -1228,11 +1302,56 @@ def render_ioc_analysis():
                         st.error("Enter a valid MD5, SHA-1, or SHA-256 hash.")
                         return
                     endpoint = "files"
-                result = query_virustotal(endpoint, normalized, vt_key)
-                show_virustotal_result(result, normalized)
+            for source in selected_sources:
+                try:
+                    if (
+                        ioc_type == "IP address"
+                        and source in {"VirusTotal", "AbuseIPDB"}
+                        and not address.is_global
+                    ):
+                        st.warning(f"This IP is not globally routable, so it was not sent to {source}.")
+                        continue
+                    if source == "VirusTotal":
+                        result = query_virustotal(endpoint, normalized, vt_key)
+                        show_virustotal_result(result, normalized)
+                    elif source == "AbuseIPDB":
+                        result = query_abuseipdb(normalized, abuseipdb_key)
+                        show_abuseipdb_result(result, normalized)
+                    elif source == "Feodo Tracker":
+                        if address.version != 4:
+                            st.info("Feodo Tracker supports IPv4 only; no lookup was made for this IPv6 address.")
+                            continue
+                        feed = load_feodo_feed()
+                        matches = feed[feed["dst_ip"] == normalized] if not feed.empty else pd.DataFrame()
+                        if matches.empty:
+                            st.success("No match for this IP was found in the current Feodo Tracker feed.")
+                        else:
+                            st.error("Feodo Tracker match found. Review this indicator before taking action.")
+                            st.dataframe(matches, hide_index=True, width="stretch")
+                            add_alert(
+                                "IOC match from manual analysis",
+                                "High",
+                                f"IPv4 {normalized} matched {len(matches)} Feodo Tracker record(s).",
+                                source_event_id=f"ioc:feodo:{normalized}",
+                            )
+                except requests.HTTPError as error:
+                    status_code = error.response.status_code if error.response is not None else "unknown"
+                    if status_code == 401 or status_code == 403:
+                        st.error(f"{source} rejected its API key or account access (HTTP {status_code}). Check its private secret.")
+                    elif status_code == 429:
+                        st.warning(f"{source} rate limit reached. Try again later.")
+                    else:
+                        st.error(f"{source} lookup failed (HTTP {status_code}).")
+                except requests.RequestException as error:
+                    st.error(f"{source} could not be reached: {error}")
+                except (KeyError, TypeError, ValueError) as error:
+                    st.error(f"{source} returned an unreadable result: {error}")
             audit_event("ioc_lookup", f"type={ioc_type}; indicator={normalized}")
         except ValueError:
-            st.error("Enter a valid IP address.")
+            if ioc_type == "IP address":
+                st.error("Enter a valid IP address.")
+            else:
+                st.error("The indicator format is invalid.")
         except Exception as error:
             st.error(f"Could not check the indicator: {error}")
 
@@ -1249,6 +1368,17 @@ def query_virustotal(object_type, indicator, api_key):
     return {"malicious": int(stats.get("malicious", 0)), "suspicious": int(stats.get("suspicious", 0)), "harmless": int(stats.get("harmless", 0)), "undetected": int(stats.get("undetected", 0)), "reputation": payload.get("reputation", 0), "country": payload.get("country", ""), "as_owner": payload.get("as_owner", ""), "type_description": payload.get("type_description", "")}
 
 
+def query_abuseipdb(indicator, api_key):
+    response = requests.get(
+        ABUSEIPDB_CHECK_URL,
+        headers={"Key": api_key, "Accept": "application/json"},
+        params={"ipAddress": indicator, "maxAgeInDays": 90},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json().get("data", {})
+
+
 def show_virustotal_result(result, indicator):
     malicious = result["malicious"]
     suspicious = result["suspicious"]
@@ -1261,9 +1391,41 @@ def show_virustotal_result(result, indicator):
     if malicious or suspicious:
         severity = "Critical" if malicious >= 5 else "High"
         st.error("Reputation engines reported suspicious activity.")
-        add_alert("Threat-intelligence IOC reputation match", severity, f"Indicator: {indicator}\nMalicious detections: {malicious}\nSuspicious detections: {suspicious}\nSource: VirusTotal reputation API")
+        add_alert(
+            "Threat-intelligence IOC reputation match",
+            severity,
+            f"Indicator: {indicator}\nMalicious detections: {malicious}\nSuspicious detections: {suspicious}\nSource: VirusTotal reputation API",
+            source_event_id=f"ioc:virustotal:{indicator}",
+        )
     else:
         st.success("No malicious or suspicious detections were returned. This does not prove the indicator is safe.")
+
+
+def show_abuseipdb_result(result, indicator):
+    confidence = int(result.get("abuseConfidenceScore", 0) or 0)
+    reports = int(result.get("totalReports", 0) or 0)
+    reporters = int(result.get("numDistinctUsers", 0) or 0)
+    columns = st.columns(4)
+    columns[0].metric("Abuse confidence", f"{confidence}%")
+    columns[1].metric("Reports", reports)
+    columns[2].metric("Distinct reporters", reporters)
+    columns[3].metric("Country", result.get("countryCode") or "Unknown")
+    st.caption(
+        f"AbuseIPDB checked {indicator}. Usage: {result.get('usageType') or 'Unknown'} · "
+        f"ISP: {result.get('isp') or 'Unknown'} · Last reported: {result.get('lastReportedAt') or 'Unknown'}. "
+        "A reputation score is a lead for review, not proof of compromise."
+    )
+    if confidence >= 50:
+        severity = "Critical" if confidence >= 90 else "High" if confidence >= 75 else "Medium"
+        st.warning("AbuseIPDB reports a meaningful abuse confidence score. Validate recency and context before responding.")
+        add_alert(
+            "AbuseIPDB IOC reputation match",
+            severity,
+            f"Indicator: {indicator}\nAbuse confidence: {confidence}%\nTotal reports: {reports}\nDistinct reporters: {reporters}\nLast reported: {result.get('lastReportedAt') or 'Unknown'}\nSource: AbuseIPDB",
+            source_event_id=f"ioc:abuseipdb:{indicator}",
+        )
+    else:
+        st.success("AbuseIPDB returned a low confidence score. This does not prove the indicator is safe.")
 
 
 def render_analytics(report):
@@ -1955,6 +2117,30 @@ def render_alert_system():
             )
         audit_event("alert_status_changed", f"alert_id={selected_id}; status={new_status}")
         st.success("Alert status updated.")
+        st.rerun()
+
+    st.markdown("#### Investigation and response checklist")
+    checklist = load_alert_checklist(selected_id)
+    completed_count = int(checklist["completed"].astype(bool).sum())
+    st.progress(
+        completed_count / max(len(checklist), 1),
+        text=f"{completed_count} of {len(checklist)} steps complete",
+    )
+    checked_items = {}
+    with st.form(f"alert_checklist_form_{selected_id}"):
+        for item in checklist.itertuples(index=False):
+            widget_key = f"alert_checklist_{selected_id}_{item.item_key}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = bool(item.completed)
+            checked_items[item.item_key] = st.checkbox(item.label, key=widget_key)
+        checklist_submitted = st.form_submit_button("Save checklist progress")
+    if checklist_submitted:
+        save_alert_checklist(selected_id, checked_items)
+        audit_event(
+            "alert_checklist_saved",
+            f"alert_id={selected_id}; completed={sum(bool(value) for value in checked_items.values())}/{len(checked_items)}",
+        )
+        st.success("Investigation checklist progress saved for this alert.")
         st.rerun()
 
 
