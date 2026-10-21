@@ -88,6 +88,31 @@ def init_db():
             db.execute(
                 "ALTER TABLE endpoint_events ADD COLUMN synced INTEGER NOT NULL DEFAULT 0"
             )
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS endpoint_sensor_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )"""
+        )
+
+
+def _set_sensor_state(key, value):
+    with sqlite3.connect(DB_PATH, timeout=10) as db:
+        db.execute(
+            "INSERT INTO endpoint_sensor_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(key), str(value)),
+        )
+
+
+def _sensor_queue_snapshot():
+    init_db()
+    with sqlite3.connect(DB_PATH, timeout=10) as db:
+        row = db.execute(
+            "SELECT MAX(created_at), COUNT(*), "
+            "SUM(CASE WHEN synced = 0 THEN 1 ELSE 0 END) FROM endpoint_events"
+        ).fetchone()
+    return row[0], int(row[1] or 0), int(row[2] or 0)
 
 
 def save_event(event_type, severity, summary, *, file_path=None,
@@ -137,9 +162,12 @@ def sync_pending_events():
     api_url = os.environ.get("CTI_API_URL", "").strip().rstrip("/")
     token = os.environ.get("CTI_API_TOKEN", "").strip()
     if not api_url or not token:
+        init_db()
+        _set_sensor_state("cloud_sync_configured", "0")
         return 0
 
     init_db()
+    _set_sensor_state("cloud_sync_configured", "1")
     with sqlite3.connect(DB_PATH, timeout=10) as db:
         rows = db.execute(
             """SELECT id, event_uid, created_at, event_type, severity, summary,
@@ -196,7 +224,41 @@ def sync_pending_events():
             f"UPDATE endpoint_events SET synced = 1 WHERE id IN ({placeholders})",
             local_ids,
         )
+    _set_sensor_state("last_cloud_sync_at", utc_now())
     return len(local_ids)
+
+
+def report_sensor_heartbeat():
+    """Report process liveness and the local upload queue to the authenticated API."""
+    init_db()
+    _set_sensor_state("last_sensor_heartbeat_at", utc_now())
+    api_url = os.environ.get("CTI_API_URL", "").strip().rstrip("/")
+    token = os.environ.get("CTI_API_TOKEN", "").strip()
+    if not api_url or not token:
+        _set_sensor_state("cloud_sync_configured", "0")
+        return False
+
+    _set_sensor_state("cloud_sync_configured", "1")
+    last_event_at, _, pending_events = _sensor_queue_snapshot()
+    try:
+        response = requests.post(
+            f"{api_url}/v1/sensors/heartbeat",
+            json={
+                "sensor_id": _sensor_id(),
+                "last_event_at": last_event_at,
+                "pending_events": pending_events,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=8,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        _set_sensor_state("last_cloud_error", f"{type(error).__name__}: {error}"[:300])
+        return False
+
+    _set_sensor_state("last_cloud_checkin_at", utc_now())
+    _set_sensor_state("last_cloud_error", "")
+    return True
 
 
 def load_feodo_ips():
@@ -506,6 +568,7 @@ def run_sensor():
     installed_apps = installed_app_snapshot()
     seen_connections = set()
     last_sync = 0.0
+    last_heartbeat = 0.0
     last_app_scan = time.monotonic()
     bad_ips = load_feodo_ips()
     try:
@@ -521,6 +584,9 @@ def run_sensor():
             if time.monotonic() - last_sync >= 10:
                 sync_pending_events()
                 last_sync = time.monotonic()
+            if time.monotonic() - last_heartbeat >= 10:
+                report_sensor_heartbeat()
+                last_heartbeat = time.monotonic()
             time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
         print("Stopping local endpoint sensor...")

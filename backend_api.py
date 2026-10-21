@@ -53,6 +53,15 @@ class EndpointEvent(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class SensorHeartbeat(Base):
+    __tablename__ = "sensor_heartbeats"
+
+    sensor_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_event_at: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    pending_events: Mapped[int] = mapped_column(Integer, default=0)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -75,6 +84,12 @@ class EventIn(BaseModel):
 
 class EventBatch(BaseModel):
     events: list[EventIn] = Field(min_length=1, max_length=200)
+
+
+class SensorHeartbeatIn(BaseModel):
+    sensor_id: str = Field(min_length=1, max_length=80)
+    last_event_at: Optional[str] = Field(default=None, max_length=40)
+    pending_events: int = Field(default=0, ge=0, le=100000)
 
 
 def require_api_token(
@@ -141,6 +156,55 @@ def list_events(
                     "remote_port": row.remote_port,
                     "risk_score": row.risk_score,
                     "details": row.details,
+                }
+                for row in rows
+            ]
+        }
+
+
+@app.post("/v1/sensors/heartbeat")
+def report_sensor_heartbeat(
+    heartbeat: SensorHeartbeatIn,
+    _token: None = Depends(require_api_token),
+):
+    now = datetime.now(timezone.utc)
+    with SessionLocal() as session:
+        row = session.get(SensorHeartbeat, heartbeat.sensor_id)
+        if row is None:
+            row = SensorHeartbeat(
+                sensor_id=heartbeat.sensor_id,
+                last_seen_at=now,
+                last_event_at=heartbeat.last_event_at,
+                pending_events=heartbeat.pending_events,
+            )
+            session.add(row)
+        else:
+            row.last_seen_at = now
+            row.last_event_at = heartbeat.last_event_at
+            row.pending_events = heartbeat.pending_events
+        session.commit()
+    return {"accepted": True, "last_seen_at": now.isoformat()}
+
+
+@app.get("/v1/sensors/status")
+def list_sensor_status(
+    limit: int = 100,
+    _token: None = Depends(require_api_token),
+):
+    limit = max(1, min(int(limit), 500))
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(SensorHeartbeat)
+            .order_by(SensorHeartbeat.last_seen_at.desc())
+            .limit(limit)
+        ).all()
+        return {
+            "sensors": [
+                {
+                    "sensor_id": row.sensor_id,
+                    "last_seen_at": row.last_seen_at.isoformat(),
+                    "last_event_at": row.last_event_at,
+                    "pending_events": row.pending_events,
                 }
                 for row in rows
             ]

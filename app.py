@@ -633,6 +633,20 @@ def init_database():
             "CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS alert_timeline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alert_id INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alert_timeline_alert_time "
+            "ON alert_timeline(alert_id, occurred_at DESC, id DESC)"
+        )
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS ai_live_reviews (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id TEXT NOT NULL,
@@ -700,6 +714,78 @@ def load_alerts():
         )
 
 
+def record_alert_timeline(alert_id, event_type, note="", actor=None):
+    """Append an investigation event to one alert's permanent timeline."""
+    username = str(actor or st.session_state.get("username", "system"))[:120]
+    with connect_db() as connection:
+        connection.execute(
+            "INSERT INTO alert_timeline "
+            "(alert_id, occurred_at, event_type, actor, note) VALUES (?, ?, ?, ?, ?)",
+            (
+                int(alert_id),
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                str(event_type)[:80],
+                username,
+                str(note)[:4000],
+            ),
+        )
+
+
+def load_alert_timeline(alert_id):
+    with connect_db() as connection:
+        timeline = pd.read_sql_query(
+            "SELECT occurred_at, event_type, actor, note FROM alert_timeline "
+            "WHERE alert_id = ? ORDER BY occurred_at DESC, id DESC",
+            connection,
+            params=(int(alert_id),),
+        )
+        if timeline.empty:
+            alert = connection.execute(
+                "SELECT created_at, severity, title, details FROM alerts WHERE id = ?",
+                (int(alert_id),),
+            ).fetchone()
+            if alert:
+                connection.execute(
+                    "INSERT INTO alert_timeline "
+                    "(alert_id, occurred_at, event_type, actor, note) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        int(alert_id),
+                        str(alert[0]),
+                        "Alert created",
+                        "system",
+                        f"{alert[1]}: {alert[2]}\n{alert[3]}",
+                    ),
+                )
+                timeline = pd.read_sql_query(
+                    "SELECT occurred_at, event_type, actor, note FROM alert_timeline "
+                    "WHERE alert_id = ? ORDER BY occurred_at DESC, id DESC",
+                    connection,
+                    params=(int(alert_id),),
+                )
+        return timeline
+
+
+def update_alert_status(alert_id, new_status):
+    """Persist an alert status change and record it in the investigation timeline."""
+    with connect_db() as connection:
+        previous = connection.execute(
+            "SELECT status FROM alerts WHERE id = ?", (int(alert_id),)
+        ).fetchone()
+        if not previous or previous[0] == new_status:
+            return False
+        connection.execute(
+            "UPDATE alerts SET status = ? WHERE id = ?",
+            (str(new_status), int(alert_id)),
+        )
+    record_alert_timeline(
+        alert_id,
+        "Status changed",
+        f"{previous[0]} → {new_status}",
+    )
+    audit_event("alert_status_changed", f"alert_id={alert_id}; status={new_status}")
+    return True
+
+
 def hide_cleared_notifications(alerts):
     """Hide active alerts created before the last clear-all action, while retaining history."""
     if alerts.empty or "created_at" not in alerts.columns:
@@ -723,6 +809,11 @@ def clear_all_notifications():
     """Close current active alerts and set a cutoff so old events cannot repopulate the inbox."""
     cleared_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     with connect_db() as connection:
+        active_ids = [
+            int(row[0]) for row in connection.execute(
+                "SELECT id FROM alerts WHERE status IN ('Open', 'Acknowledged')"
+            ).fetchall()
+        ]
         cursor = connection.execute(
             "UPDATE alerts SET status = 'Closed' WHERE status IN ('Open', 'Acknowledged')"
         )
@@ -732,6 +823,8 @@ def clear_all_notifications():
             (cleared_at,),
         )
     count = max(int(cursor.rowcount), 0)
+    for alert_id in active_ids:
+        record_alert_timeline(alert_id, "Status changed", "Open notification cleared; status set to Closed.")
     # Keep the Alert System focused on active items after clearing, even if the user
     # previously selected Closed/Resolved in its status filter.
     st.session_state["alert_status_filter"] = ["Open", "Acknowledged"]
@@ -861,6 +954,7 @@ def send_security_email(subject, body):
 
 
 def add_alert(title, severity, details, mitre_id="", source_event_id=None):
+    alert_id = None
     with connect_db() as connection:
         created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if source_event_id:
@@ -872,13 +966,16 @@ def add_alert(title, severity, details, mitre_id="", source_event_id=None):
             )
             if cursor.rowcount == 0:
                 return False
+            alert_id = int(cursor.lastrowid)
         else:
-            connection.execute(
+            cursor = connection.execute(
                 """INSERT INTO alerts
                    (created_at, title, severity, details, mitre_id, status)
                    VALUES (?, ?, ?, ?, ?, 'Open')""",
                 (created_at, title, severity, details, mitre_id),
             )
+            alert_id = int(cursor.lastrowid)
+    record_alert_timeline(alert_id, "Alert created", f"{severity}: {title}\n{details}")
     audit_event("alert_created", f"severity={severity}; title={title[:150]}")
     notify_security_alert(severity, title)
     return True
@@ -914,6 +1011,12 @@ def save_alert_checklist(alert_id, checked_items):
                 for item_key, checked in checked_items.items()
             ],
         )
+    completed = sum(bool(value) for value in checked_items.values())
+    record_alert_timeline(
+        alert_id,
+        "Checklist updated",
+        f"Investigation checklist saved: {completed}/{len(checked_items)} steps complete.",
+    )
 
 
 def sync_endpoint_alerts(events):
@@ -932,6 +1035,7 @@ def sync_endpoint_alerts(events):
     inserted = 0
     notifications = []
     audit_rows = []
+    timeline_rows = []
     with connect_db() as connection:
         for event in events.to_dict("records"):
             event_severity = value(event, "severity").title()
@@ -988,8 +1092,11 @@ def sync_endpoint_alerts(events):
             )
             inserted += max(cursor.rowcount, 0)
             if cursor.rowcount > 0:
+                timeline_rows.append((int(cursor.lastrowid), event_severity, summary, details))
                 notifications.append((severity_map[event_severity], f"Endpoint signal: {summary}"))
                 audit_rows.append(f"severity={severity_map[event_severity]}; event_id={event_id}")
+    for alert_id, severity, summary, details in timeline_rows:
+        record_alert_timeline(alert_id, "Alert created", f"{severity}: {summary}\n{details}")
     for detail in audit_rows:
         audit_event("endpoint_alert_created", detail)
     for severity, title in notifications:
@@ -1050,46 +1157,209 @@ def load_sensor_events(limit=500):
         ), "local"
 
 
-def sensor_health_status(events, source):
-    """Report local sensor process health, or cloud telemetry recency without guessing process state."""
-    if source == "cloud":
-        if events.empty:
-            return "Waiting for telemetry", "The cloud API has not received an endpoint event yet."
-        time_column = next((name for name in ("occurred_at", "created_at") if name in events.columns), None)
-        if not time_column:
-            return "Telemetry available", "Endpoint events are available, but their timestamps are missing."
-        timestamps = pd.to_datetime(events[time_column], utc=True, errors="coerce").dropna()
-        if timestamps.empty:
-            return "Telemetry available", "Endpoint events are available, but their timestamps could not be read."
-        latest = timestamps.max()
-        age_seconds = max(0, (datetime.now(timezone.utc) - latest.to_pydatetime()).total_seconds())
-        age_minutes = int(age_seconds // 60)
-        if age_seconds <= 120:
-            return "Recent telemetry", "The cloud received an endpoint event within the last 2 minutes."
-        return "No recent telemetry", f"Last cloud event was about {age_minutes} minute(s) ago; quiet activity does not prove the sensor is stopped."
+@st.cache_data(ttl=3, show_spinner=False)
+def load_cloud_sensor_heartbeats():
+    """Read authenticated sensor heartbeats from the endpoint API."""
+    api_url = setting("API_BASE_URL").rstrip("/")
+    api_token = setting("API_TOKEN")
+    if not api_url or not api_token:
+        return [], "not_configured"
+    response = requests.get(
+        f"{api_url}/v1/sensors/status?limit=100",
+        headers={"Authorization": f"Bearer {api_token}"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    return response.json().get("sensors", []), "cloud"
 
-    if os.name != "nt" and os.environ.get("CTI_DESKTOP_MODE") != "1":
-        return "Laptop sensor not visible", "A hosted dashboard cannot inspect the laptop process directly. Use the local desktop app or connect the endpoint API."
 
+def local_sensor_snapshot():
+    """Read local event, upload-queue, and sensor-process timestamps when available."""
+    snapshot = {"last_event_at": None, "event_count": 0, "pending_events": 0, "state": {}}
+    if not DATABASE_PATH.exists():
+        return snapshot
     try:
-        import psutil
-        expected_script = os.path.normcase(os.path.abspath(BASE_DIR / "endpoint_monitor.py"))
-        running = False
-        for process in psutil.process_iter(["cmdline"]):
-            try:
-                for argument in process.info.get("cmdline") or []:
-                    if os.path.normcase(os.path.abspath(str(argument))) == expected_script:
-                        running = True
+        with connect_db() as connection:
+            tables = {
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "endpoint_events" in tables:
+                columns = {
+                    row[1] for row in connection.execute(
+                        "PRAGMA table_info(endpoint_events)"
+                    ).fetchall()
+                }
+                pending_expression = (
+                    "COALESCE(SUM(CASE WHEN synced = 0 THEN 1 ELSE 0 END), 0)"
+                    if "synced" in columns
+                    else "0"
+                )
+                row = connection.execute(
+                    f"SELECT MAX(created_at), COUNT(*), {pending_expression} "
+                    "FROM endpoint_events"
+                ).fetchone()
+                snapshot.update(
+                    last_event_at=row[0],
+                    event_count=int(row[1] or 0),
+                    pending_events=int(row[2] or 0),
+                )
+            if "endpoint_sensor_state" in tables:
+                snapshot["state"] = dict(connection.execute(
+                    "SELECT key, value FROM endpoint_sensor_state"
+                ).fetchall())
+    except sqlite3.Error:
+        pass
+    return snapshot
+
+
+def sensor_age_label(timestamp):
+    if timestamp is None:
+        return "Never"
+    parsed = pd.to_datetime(timestamp, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return "Unknown"
+    seconds = max(0, int((datetime.now(timezone.utc) - parsed.to_pydatetime()).total_seconds()))
+    if seconds < 10:
+        return "Just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def sensor_health_report(events, source):
+    """Combine sensor liveness, last activity, and event-upload backlog."""
+    if source == "cloud":
+        try:
+            sensors, status_source = load_cloud_sensor_heartbeats()
+        except requests.RequestException as error:
+            return {
+                "status": "Heartbeat unavailable",
+                "last_heartbeat": "Unknown",
+                "last_event": "Unknown",
+                "cloud_sync": "Unknown",
+                "pending": "Unknown",
+                "explanation": (
+                    "The endpoint API could not provide sensor heartbeat status. "
+                    "Check API availability and deploy the updated endpoint API. "
+                    f"Details: {type(error).__name__}"
+                ),
+            }
+        if status_source == "not_configured":
+            return {
+                "status": "API not configured",
+                "last_heartbeat": "Unknown",
+                "last_event": "Unknown",
+                "cloud_sync": "Not configured",
+                "pending": "Unknown",
+                "explanation": "Set API_BASE_URL and API_TOKEN in the dashboard's private settings.",
+            }
+        if not sensors:
+            last_event = None
+            if events is not None and not events.empty:
+                time_column = next((name for name in ("occurred_at", "created_at") if name in events), None)
+                if time_column:
+                    last_event = events[time_column].dropna().max()
+            return {
+                "status": "Waiting for heartbeat",
+                "last_heartbeat": "Never",
+                "last_event": sensor_age_label(last_event),
+                "cloud_sync": "No sensor check-in",
+                "pending": "Unknown",
+                "explanation": "The API has no sensor heartbeat yet. Start the local sensor and update the deployed API if needed.",
+            }
+
+        latest = sensors[0]
+        seen_at = latest.get("last_seen_at")
+        parsed_seen = pd.to_datetime(seen_at, utc=True, errors="coerce")
+        age_seconds = (
+            max(0, (datetime.now(timezone.utc) - parsed_seen.to_pydatetime()).total_seconds())
+            if not pd.isna(parsed_seen)
+            else float("inf")
+        )
+        online = age_seconds <= 45
+        pending_count = int(latest.get("pending_events", 0) or 0)
+        last_event = latest.get("last_event_at")
+        return {
+            "status": "Online" if online else "Offline · stale heartbeat",
+            "last_heartbeat": sensor_age_label(seen_at),
+            "last_event": sensor_age_label(last_event),
+            "cloud_sync": f"{pending_count} pending" if pending_count else ("Connected" if online else "Not confirmed"),
+            "pending": str(pending_count),
+            "explanation": (
+                f"Sensor {latest.get('sensor_id', '')[:12]}… last checked in {sensor_age_label(seen_at)}. "
+                "A quiet event stream alone does not mean the sensor stopped."
+            ),
+        }
+
+    snapshot = local_sensor_snapshot()
+    if os.name != "nt" and os.environ.get("CTI_DESKTOP_MODE") != "1":
+        process_running = False
+        status = "Laptop status unavailable"
+        explanation = "A hosted dashboard cannot inspect the laptop process directly; it uses the sensor's cloud heartbeat."
+    else:
+        try:
+            import psutil
+            expected_script = os.path.normcase(os.path.abspath(BASE_DIR / "endpoint_monitor.py"))
+            process_running = False
+            for process in psutil.process_iter(["cmdline"]):
+                try:
+                    if any(
+                        os.path.normcase(os.path.abspath(str(argument))) == expected_script
+                        for argument in (process.info.get("cmdline") or [])
+                    ):
+                        process_running = True
                         break
-            except (psutil.Error, OSError, TypeError, ValueError):
-                continue
-            if running:
-                break
-    except (ImportError, OSError):
-        return "Status unavailable", "Process monitoring is unavailable on this computer."
-    if running:
-        return "Running", "The local endpoint sensor process is active on this computer."
-    return "Stopped", "The local endpoint sensor process is not running. Start the desktop app to launch it."
+                except (psutil.Error, OSError, TypeError, ValueError):
+                    continue
+            status = "Running" if process_running else "Stopped"
+            explanation = (
+                "The local sensor process is active."
+                if process_running
+                else "The local sensor process is not active. Start the desktop app to launch it."
+            )
+        except (ImportError, OSError):
+            process_running = False
+            status = "Status unavailable"
+            explanation = "Process monitoring is unavailable on this computer."
+
+    state = snapshot["state"]
+    api_configured = state.get("cloud_sync_configured") == "1" or bool(
+        setting("API_BASE_URL") and setting("API_TOKEN")
+    )
+    if not api_configured:
+        cloud_sync = "Local only"
+    elif snapshot["pending_events"]:
+        cloud_sync = f"{snapshot['pending_events']} pending"
+    elif state.get("last_cloud_checkin_at") and sensor_age_label(state["last_cloud_checkin_at"]) not in ("Never", "Unknown"):
+        last_checkin = pd.to_datetime(state["last_cloud_checkin_at"], utc=True, errors="coerce")
+        cloud_sync = "Connected" if not pd.isna(last_checkin) and (datetime.now(timezone.utc) - last_checkin.to_pydatetime()).total_seconds() <= 45 else "Stale"
+    else:
+        cloud_sync = "Awaiting first check-in"
+    return {
+        "status": status,
+        "last_heartbeat": sensor_age_label(state.get("last_sensor_heartbeat_at")),
+        "last_event": sensor_age_label(snapshot["last_event_at"]),
+        "cloud_sync": cloud_sync,
+        "pending": str(snapshot["pending_events"]),
+        "explanation": explanation,
+    }
+
+
+def render_sensor_health_cards(events, source):
+    report = sensor_health_report(events, source)
+    st.markdown("#### Sensor health and cloud sync")
+    status_col, heartbeat_col, event_col, sync_col = st.columns(4)
+    status_col.metric("Sensor", report["status"], help=report["explanation"])
+    heartbeat_col.metric("Last heartbeat", report["last_heartbeat"])
+    event_col.metric("Last event", report["last_event"])
+    sync_col.metric("Cloud sync", report["cloud_sync"])
+    st.caption(f"Sensor-reported upload queue: {report['pending']} event(s). {report['explanation']}")
 
 
 @st.fragment(run_every="5s")
@@ -1133,12 +1403,7 @@ def render_dashboard_alert_inbox():
         )
         if st.button("Acknowledge alert", key="dashboard_acknowledge_alert"):
             selected_id = alert_options[selected_label]
-            with connect_db() as connection:
-                connection.execute(
-                    "UPDATE alerts SET status = 'Acknowledged' WHERE id = ? AND status = 'Open'",
-                    (selected_id,),
-                )
-            audit_event("alert_status_changed", f"alert_id={selected_id}; status=Acknowledged")
+            update_alert_status(selected_id, "Acknowledged")
             st.rerun()
 
 
@@ -1266,8 +1531,7 @@ def render_dashboard(report):
     def sensor_health_tile():
         try:
             latest_events, latest_source = load_sensor_events(limit=500)
-            health, explanation = sensor_health_status(latest_events, latest_source)
-            st.metric("Endpoint sensor", health, help=explanation)
+            render_sensor_health_cards(latest_events, latest_source)
         except Exception:
             st.metric("Endpoint sensor", "Unavailable", help="Could not read sensor status or recent telemetry.")
 
@@ -1461,12 +1725,11 @@ def render_endpoint_security():
 
         if st.button("Refresh events", key="refresh_endpoint_events"):
             load_sensor_events.clear()
+            load_cloud_sensor_heartbeats.clear()
             st.rerun()
 
         st.caption("Event source: " + ("deployed API" if source == "cloud" else "this computer") + " · Auto-refresh: 5 sec")
-        sensor_state, sensor_explanation = sensor_health_status(events, source)
-        st.metric("Sensor health", sensor_state, help=sensor_explanation)
-        st.caption(sensor_explanation)
+        render_sensor_health_cards(events, source)
         if events.empty:
             st.info("No events have arrived yet. Start the sensor; this list refreshes automatically.")
             return
@@ -1978,6 +2241,7 @@ def create_ai_anomaly_alerts(events):
     inserted = 0
     notifications = []
     audit_rows = []
+    timeline_rows = []
     with connect_db() as connection:
         for event in events.to_dict("records"):
             event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
@@ -2012,8 +2276,16 @@ def create_ai_anomaly_alerts(events):
             )
             inserted += max(cursor.rowcount, 0)
             if cursor.rowcount > 0:
+                timeline_rows.append((
+                    int(cursor.lastrowid),
+                    severity,
+                    f"AI anomaly: {summary[:120]}",
+                    details,
+                ))
                 notifications.append((severity, f"AI anomaly: {summary[:120]}"))
                 audit_rows.append(f"severity={severity}; event_id={event_id}; score={score}")
+    for alert_id, severity, title, details in timeline_rows:
+        record_alert_timeline(alert_id, "Alert created", f"{severity}: {title}\n{details}")
     for detail in audit_rows:
         audit_event("ai_anomaly_alert_created", detail)
     for severity, title in notifications:
@@ -2453,14 +2725,18 @@ def render_alert_system():
     selected_id = alert_options[selected_label]
     new_status = st.selectbox("New alert status", ["Open", "Acknowledged", "Resolved", "Closed"])
     if st.button("Save alert status"):
-        with connect_db() as connection:
-            connection.execute(
-                "UPDATE alerts SET status = ? WHERE id = ?",
-                (new_status, int(selected_id)),
-            )
-        audit_event("alert_status_changed", f"alert_id={selected_id}; status={new_status}")
-        st.success("Alert status updated.")
+        changed = update_alert_status(selected_id, new_status)
+        if changed:
+            st.success("Alert status updated and added to its investigation timeline.")
+        else:
+            st.info("The alert already has that status.")
         st.rerun()
+
+    selected_alert = visible.loc[visible["id"].astype(int) == int(selected_id)].iloc[0]
+    with st.expander("Alert evidence and context"):
+        st.caption(f"Created: {selected_alert.get('created_at', 'Unknown')}")
+        st.caption(f"MITRE ATT&CK: {selected_alert.get('mitre_id') or 'Not mapped'}")
+        st.text(str(selected_alert.get("details") or "No additional evidence was recorded."))
 
     st.markdown("#### Investigation and response checklist")
     checklist = load_alert_checklist(selected_id)
@@ -2485,6 +2761,40 @@ def render_alert_system():
         )
         st.success("Investigation checklist progress saved for this alert.")
         st.rerun()
+
+    st.markdown("#### Investigation timeline")
+    note_key = f"alert_investigation_note_{selected_id}"
+    with st.form(f"alert_note_form_{selected_id}", clear_on_submit=True):
+        investigation_note = st.text_area(
+            "Add an investigation note",
+            key=note_key,
+            placeholder="Record what you checked, evidence observed, and the decision made.",
+            max_chars=4000,
+        )
+        note_submitted = st.form_submit_button("Add note to timeline")
+    if note_submitted:
+        if not investigation_note.strip():
+            st.warning("Enter a note before saving it to the timeline.")
+        else:
+            record_alert_timeline(selected_id, "Investigation note", investigation_note.strip())
+            audit_event("alert_investigation_note_added", f"alert_id={selected_id}")
+            st.success("Investigation note saved.")
+            st.rerun()
+
+    timeline = load_alert_timeline(selected_id)
+    if timeline.empty:
+        st.caption("No investigation activity has been recorded for this alert yet.")
+    else:
+        st.dataframe(
+            timeline.rename(columns={
+                "occurred_at": "Time (UTC)",
+                "event_type": "Activity",
+                "actor": "User",
+                "note": "Details",
+            }),
+            hide_index=True,
+            width="stretch",
+        )
 
 
 def render_incident_management():
@@ -2617,6 +2927,7 @@ def render_log_analyzer():
     if st.button("Create alerts from log findings"):
         inserted = 0
         notifications = []
+        timeline_rows = []
         with connect_db() as connection:
             for row in findings.to_dict("records"):
                 title = f"Log finding: {row['reason']}"
@@ -2630,7 +2941,15 @@ def render_log_analyzer():
                 )
                 inserted += max(cursor.rowcount, 0)
                 if cursor.rowcount > 0:
+                    timeline_rows.append((
+                        int(cursor.lastrowid),
+                        row["severity"],
+                        title[:250],
+                        f"Source file: {Path(upload.name).name}\nLine: {row['line_number']}\nSource IP: {row['source_ip'] or 'not found'}\nReason: {row['reason']}",
+                    ))
                     notifications.append((row["severity"], title[:120]))
+        for alert_id, severity, title, details in timeline_rows:
+            record_alert_timeline(alert_id, "Alert created", f"{severity}: {title}\n{details}")
         for severity, title in notifications:
             notify_security_alert(severity, title)
         audit_event("log_findings_promoted", f"filename={Path(upload.name).name}; findings={len(findings)}; new_alerts={inserted}")
