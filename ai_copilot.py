@@ -198,11 +198,12 @@ def generate_review(
             provider_error = {}
         provider_code = str(provider_error.get("code") or "").lower()
         provider_type = str(provider_error.get("type") or "").lower()
-        if provider_code in {"insufficient_quota", "billing_hard_limit_reached", "credit_balance_exhausted"}:
+        provider_reasons = {provider_code, provider_type}
+        if provider_reasons & {"insufficient_quota", "billing_hard_limit_reached", "credit_balance_exhausted"}:
             raise AICopilotError("OpenAI API credits or billing quota are exhausted. Check API billing before retrying.")
-        if provider_code in {"organization_spend_limit_exceeded", "project_spend_limit_exceeded"}:
+        if provider_reasons & {"organization_spend_limit_exceeded", "project_spend_limit_exceeded"}:
             raise AICopilotError("OpenAI API spend limit was reached. Review the organization or project spend limit.")
-        if provider_code == "organization_usage_limit_exceeded":
+        if "organization_usage_limit_exceeded" in provider_reasons:
             raise AICopilotError("OpenAI's approved organization usage limit was reached. Check the Limits page or contact support.")
         if provider_code in {"rate_limit_exceeded", "slow_down"} or provider_type == "rate_limit_error":
             raise AICopilotError("OpenAI request rate limit was reached. The app will wait before trying another review.")
