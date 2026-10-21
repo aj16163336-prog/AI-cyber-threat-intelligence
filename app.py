@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -143,6 +144,215 @@ def render_optional_ai_review(*, payload, review_type, key_suffix, disclosure):
             st.markdown("**AI-generated analyst aid**")
             st.markdown(saved.get("text", ""))
             st.caption("Advisory only. Verify the evidence and conclusions before acting.")
+
+
+LIVE_AI_MIN_INTERVAL_SECONDS = 60
+LIVE_AI_MAX_REQUESTS_PER_HOUR = 10
+LIVE_AI_RETRY_COOLDOWN_MINUTES = 15
+LIVE_AI_OUTPUT_TOKENS = 220
+
+
+@st.cache_resource
+def live_ai_executor():
+    """Keep one background API worker across Streamlit reruns."""
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="cti-live-ai")
+
+
+def _finish_live_ai_review(review_id, api_key, model, payload):
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        answer = generate_review(
+            payload=payload,
+            api_key=api_key,
+            model=model,
+            review_type="event",
+            max_output_tokens=LIVE_AI_OUTPUT_TOKENS,
+            timeout=(4, 12),
+        )
+        status, review_text, error = "complete", answer, ""
+    except AICopilotError as exc:
+        status, review_text, error = "error", "", str(exc)
+    except Exception as exc:
+        status, review_text, error = "error", "", f"Unexpected AI review error ({type(exc).__name__})."
+
+    with connect_db() as connection:
+        connection.execute(
+            """UPDATE ai_live_reviews
+               SET status = ?, updated_at = ?, review_text = ?, error = ?
+               WHERE id = ?""",
+            (status, updated_at, review_text, error[:500], review_id),
+        )
+        if status == "error":
+            retry_after = (
+                datetime.now(timezone.utc) + timedelta(minutes=LIVE_AI_RETRY_COOLDOWN_MINUTES)
+            ).isoformat(timespec="seconds")
+            connection.execute(
+                "INSERT INTO app_state (key, value) VALUES ('openai_live_retry_after', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (retry_after,),
+            )
+        connection.execute(
+            "INSERT INTO audit_log (occurred_at, username, action, details) VALUES (?, ?, ?, ?)",
+            (updated_at, "system", "openai_live_review_" + status, f"model={model}; error={error[:250]}"),
+        )
+
+
+def _queue_live_ai_review(events, enabled):
+    """Queue one bounded OpenAI review for a new high-risk live event."""
+    if not enabled:
+        return "paused"
+    api_key = setting("OPENAI_API_KEY")
+    if not api_key:
+        return "missing_key"
+    if "AI risk score" not in events:
+        return "no_candidate"
+
+    anomaly = events.get("AI anomaly", pd.Series(False, index=events.index)).fillna(False).astype(bool)
+    ioc_match = events.get("Threat-intel IOC", pd.Series(False, index=events.index)).fillna(False).astype(bool)
+    risk = pd.to_numeric(events["AI risk score"], errors="coerce").fillna(0)
+    candidates = events.loc[(risk >= 70) & (anomaly | ioc_match)].copy()
+    if candidates.empty:
+        return "waiting"
+
+    occurred_col = "occurred_at" if "occurred_at" in candidates else "created_at"
+    candidates["_live_ai_risk"] = risk.loc[candidates.index]
+    time_values = candidates[occurred_col] if occurred_col in candidates else pd.Series("", index=candidates.index)
+    candidates["_live_ai_time"] = pd.to_datetime(time_values, utc=True, errors="coerce")
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    candidates = candidates.loc[candidates["_live_ai_time"] >= recent_cutoff]
+    if candidates.empty:
+        return "waiting"
+    def event_identity(row):
+        for field in ("event_id", "event_uid", "id"):
+            value = row.get(field)
+            if value is not None and not pd.isna(value) and str(value).strip():
+                return str(value).strip()[:160]
+        return ""
+
+    candidates["_live_event_id"] = candidates.apply(event_identity, axis=1)
+    candidates = candidates.loc[candidates["_live_event_id"].ne("")]
+    if candidates.empty:
+        return "missing_event_id"
+    candidates = candidates.sort_values(
+        ["_live_ai_risk", "_live_ai_time"], ascending=[False, False], kind="stable"
+    )
+    model = setting("OPENAI_MODEL", DEFAULT_OPENAI_MODEL) or DEFAULT_OPENAI_MODEL
+    now = datetime.now(timezone.utc)
+    now_text = now.isoformat(timespec="seconds")
+    hour_ago = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+
+    with connect_db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """UPDATE ai_live_reviews
+               SET status = 'error', updated_at = ?, error = 'Previous review worker did not finish.'
+               WHERE status = 'pending' AND requested_at < ?""",
+            (
+                now_text,
+                (now - timedelta(minutes=2)).isoformat(timespec="seconds"),
+            ),
+        )
+        retry_row = connection.execute(
+            "SELECT value FROM app_state WHERE key = 'openai_live_retry_after'"
+        ).fetchone()
+        if retry_row:
+            retry_at = pd.to_datetime(retry_row[0], utc=True, errors="coerce")
+            if not pd.isna(retry_at) and retry_at.to_pydatetime() > now:
+                connection.commit()
+                return "cooldown"
+
+        reviewed_ids = {
+            row[0]
+            for row in connection.execute(
+                """SELECT review.event_id FROM ai_live_reviews AS review
+                   WHERE review.status IN ('pending', 'complete')
+                     AND review.id = (
+                         SELECT MAX(latest.id) FROM ai_live_reviews AS latest
+                         WHERE latest.event_id = review.event_id
+                     )"""
+            ).fetchall()
+        }
+        candidates = candidates.loc[~candidates["_live_event_id"].isin(reviewed_ids)]
+        if candidates.empty:
+            connection.commit()
+            return "already_reviewed"
+
+        selected = candidates.iloc[0]
+        event_id = selected["_live_event_id"]
+        payload = build_event_context(selected.to_dict())
+
+        recent_count = connection.execute(
+            "SELECT COUNT(*) FROM ai_live_reviews WHERE requested_at >= ?",
+            (hour_ago,),
+        ).fetchone()[0]
+        if recent_count >= LIVE_AI_MAX_REQUESTS_PER_HOUR:
+            connection.commit()
+            return "hourly_cap"
+        last_request = connection.execute(
+            "SELECT requested_at FROM ai_live_reviews ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if last_request:
+            last_at = pd.to_datetime(last_request[0], utc=True, errors="coerce")
+            if not pd.isna(last_at) and (now - last_at.to_pydatetime()).total_seconds() < LIVE_AI_MIN_INTERVAL_SECONDS:
+                connection.commit()
+                return "interval"
+
+        cursor = connection.execute(
+            """INSERT INTO ai_live_reviews
+               (event_id, status, requested_at, updated_at, model)
+               VALUES (?, 'pending', ?, ?, ?)""",
+            (event_id, now_text, now_text, model),
+        )
+        review_id = cursor.lastrowid
+        connection.execute(
+            "DELETE FROM ai_live_reviews WHERE id NOT IN "
+            "(SELECT id FROM ai_live_reviews ORDER BY id DESC LIMIT 250)"
+        )
+        connection.commit()
+
+    try:
+        live_ai_executor().submit(_finish_live_ai_review, review_id, api_key, model, payload)
+    except RuntimeError:
+        with connect_db() as connection:
+            connection.execute(
+                "UPDATE ai_live_reviews SET status = 'error', updated_at = ?, error = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(timespec="seconds"), "Live AI worker is unavailable.", review_id),
+            )
+        return "worker_error"
+    return "queued"
+
+
+def _render_live_ai_review(enabled, queue_state):
+    with connect_db() as connection:
+        row = connection.execute(
+            """SELECT event_id, status, updated_at, model, review_text, error
+               FROM ai_live_reviews ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+    if row and row[1] == "complete":
+        st.markdown("**Live OpenAI analyst review**")
+        st.caption(f"Event {row[0]} · {row[3]} · {row[2]}")
+        st.write(row[4])
+        st.caption("Advisory only. Verify the event; this does not change the detector's risk score or verdict.")
+    elif row and row[1] == "pending":
+        st.info(f"OpenAI live review is processing high-risk event {row[0]} in the background.")
+    elif row and row[1] == "error":
+        st.warning(f"OpenAI live review is unavailable: {row[5]}")
+        if queue_state == "cooldown" and st.button("Retry live AI now", key="retry_live_openai_now"):
+            with connect_db() as connection:
+                connection.execute("DELETE FROM app_state WHERE key = 'openai_live_retry_after'")
+            st.rerun()
+    elif queue_state == "queued":
+        st.info("A new high-risk event was queued for live OpenAI review.")
+    elif queue_state == "hourly_cap":
+        st.info("Live OpenAI review paused after reaching its 10-request hourly safety limit.")
+    elif queue_state == "cooldown":
+        st.info("Live OpenAI review is paused temporarily after a provider error. The app will retry after the cooldown.")
+    elif queue_state == "paused" or not enabled:
+        st.info("Live OpenAI review is turned off. The local anomaly detector remains active.")
+    elif queue_state == "missing_key":
+        st.info("Add OPENAI_API_KEY to this app's private settings to enable live OpenAI reviews.")
+    elif queue_state == "waiting":
+        st.caption("Waiting for a new high-risk anomaly or threat-feed match before sending metadata to OpenAI.")
 
 
 def save_local_email_settings(values):
@@ -421,6 +631,26 @@ def init_database():
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS ai_live_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                model TEXT NOT NULL,
+                review_text TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_live_reviews_requested_at "
+            "ON ai_live_reviews(requested_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ai_live_reviews_event_id "
+            "ON ai_live_reviews(event_id, id DESC)"
         )
         connection.execute(
             """CREATE TABLE IF NOT EXISTS alert_checklist (
@@ -1618,7 +1848,27 @@ def analyze_live_events(events, model_minimum=20):
     return events, model_label
 
 
-def render_live_ai_panel(show_assistant=False):
+def render_live_ai_toggle():
+    api_key_configured = bool(setting("OPENAI_API_KEY"))
+    default_enabled = api_key_configured
+    enabled = st.checkbox(
+        "Enable live OpenAI reviews",
+        value=default_enabled,
+        key="live_openai_reviews_enabled",
+        disabled=not api_key_configured,
+        help="Reviews only new High/Critical anomalies or threat-feed matches. Limited to one request per minute and 10 requests per hour.",
+    )
+    if api_key_configured:
+        st.caption(
+            "OpenAI receives allow-listed event metadata only (event type, scores, indicators, process name, and remote IP/port). "
+            "File contents, full paths, and file hashes are excluded. API usage may be billed."
+        )
+    else:
+        st.info("Configure OPENAI_API_KEY in this app's private settings to enable live OpenAI reviews.")
+    return enabled
+
+
+def render_live_ai_panel(show_assistant=False, live_openai_enabled=False):
     """Refresh endpoint events and run a cached rolling Isolation Forest."""
     try:
         events, source = load_sensor_events(limit=500)
@@ -1632,6 +1882,7 @@ def render_live_ai_panel(show_assistant=False):
 
     model_minimum = 20
     events, model_label = analyze_live_events(events, model_minimum)
+    live_ai_state = _queue_live_ai_review(events, live_openai_enabled)
 
     occurred_col = "occurred_at" if "occurred_at" in events else "created_at"
     latest = "Unavailable"
@@ -1645,6 +1896,7 @@ def render_live_ai_panel(show_assistant=False):
     c3.metric("Threat-feed IOC matches", int(events["Threat-intel IOC"].sum()))
     c4.metric("Highest AI risk", f"{events['AI risk score'].max():.0f}/100")
     st.caption(f"Live model: {model_label}. The anomaly score is a relative ranking within this window, not a malware probability or verdict.")
+    _render_live_ai_review(live_openai_enabled, live_ai_state)
 
     display_columns = [column for column in [occurred_col, "event_type", "AI severity", "AI risk score", "AI anomaly", "AI anomaly score", "AI indicators", "process_name", "remote_ip", "summary"] if column in events]
     st.dataframe(events[display_columns].head(50), hide_index=True, width="stretch")
@@ -1771,11 +2023,12 @@ def create_ai_anomaly_alerts(events):
 
 def render_ai_engine(report):
     render_page_heading("AI Engine")
-    st.write("Live AI analysis of endpoint sensor metadata, refreshed automatically every 5 seconds.")
+    st.write("Live endpoint anomaly detection with bounded OpenAI analyst reviews for new high-risk events.")
+    live_openai_enabled = render_live_ai_toggle()
 
     @st.fragment(run_every="5s")
     def live_panel():
-        render_live_ai_panel()
+        render_live_ai_panel(live_openai_enabled=live_openai_enabled)
 
     live_panel()
     with st.expander("Historical UNSW-NB15 model output"):
@@ -1791,10 +2044,11 @@ def render_explainable_ai_assistant():
     render_page_heading("Explainable AI Assistant")
     st.write("Select a live endpoint event to see the exact signals behind its risk score and suggested analyst checks.")
     st.caption("This assistant explains the sensor and model evidence available in the event; it does not invent conclusions or label the score as a probability.")
+    live_openai_enabled = render_live_ai_toggle()
 
     @st.fragment(run_every="10s")
     def assistant_panel():
-        render_live_ai_panel(show_assistant=True)
+        render_live_ai_panel(show_assistant=True, live_openai_enabled=live_openai_enabled)
 
     assistant_panel()
 

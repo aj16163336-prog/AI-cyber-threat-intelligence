@@ -129,8 +129,16 @@ def _extract_text(response_json):
     return "\n".join(parts).strip()
 
 
-def generate_review(*, payload, api_key, model=DEFAULT_MODEL, review_type="event"):
-    """Make one user-triggered Responses API request; never persist provider state."""
+def generate_review(
+    *,
+    payload,
+    api_key,
+    model=DEFAULT_MODEL,
+    review_type="event",
+    max_output_tokens=MAX_OUTPUT_TOKENS,
+    timeout=(8, 40),
+):
+    """Make one bounded Responses API request; never persist provider state."""
     if not api_key:
         raise AICopilotError("OpenAI API key is not configured.")
     model = _safe_token(model, 80) or DEFAULT_MODEL
@@ -155,11 +163,16 @@ def generate_review(*, payload, api_key, model=DEFAULT_MODEL, review_type="event
         "secrets, file contents, credentials, or additional personal data. This is advisory triage only; "
         "a human must verify every conclusion.\n\n" + task
     )
+    try:
+        output_limit = int(max_output_tokens)
+    except (TypeError, ValueError, OverflowError):
+        output_limit = MAX_OUTPUT_TOKENS
+    output_limit = max(64, min(MAX_OUTPUT_TOKENS, output_limit))
     body = {
         "model": model,
         "instructions": instructions,
         "input": json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "max_output_tokens": output_limit,
         "store": False,
         "tools": [],
     }
@@ -168,7 +181,7 @@ def generate_review(*, payload, api_key, model=DEFAULT_MODEL, review_type="event
             RESPONSES_URL,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=body,
-            timeout=(8, 40),
+            timeout=timeout,
         )
     except requests.Timeout as error:
         raise AICopilotError("The AI provider timed out. Try again later.") from error
@@ -177,7 +190,23 @@ def generate_review(*, payload, api_key, model=DEFAULT_MODEL, review_type="event
     if response.status_code == 401:
         raise AICopilotError("The OpenAI API key was rejected. Check the private app Secrets setting.")
     if response.status_code == 429:
-        raise AICopilotError("The AI provider rate limit or API billing limit was reached.")
+        try:
+            provider_error = response.json().get("error", {})
+        except (ValueError, TypeError, AttributeError):
+            provider_error = {}
+        if not isinstance(provider_error, dict):
+            provider_error = {}
+        provider_code = str(provider_error.get("code") or "").lower()
+        provider_type = str(provider_error.get("type") or "").lower()
+        if provider_code in {"insufficient_quota", "billing_hard_limit_reached", "credit_balance_exhausted"}:
+            raise AICopilotError("OpenAI API credits or billing quota are exhausted. Check API billing before retrying.")
+        if provider_code in {"organization_spend_limit_exceeded", "project_spend_limit_exceeded"}:
+            raise AICopilotError("OpenAI API spend limit was reached. Review the organization or project spend limit.")
+        if provider_code == "organization_usage_limit_exceeded":
+            raise AICopilotError("OpenAI's approved organization usage limit was reached. Check the Limits page or contact support.")
+        if provider_code in {"rate_limit_exceeded", "slow_down"} or provider_type == "rate_limit_error":
+            raise AICopilotError("OpenAI request rate limit was reached. The app will wait before trying another review.")
+        raise AICopilotError("OpenAI returned HTTP 429. Check the API Limits and Billing pages for the exact account restriction.")
     if not response.ok:
         raise AICopilotError(f"The AI provider returned HTTP {response.status_code}. Check the API configuration.")
     try:
