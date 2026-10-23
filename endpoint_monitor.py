@@ -547,6 +547,9 @@ def observe_connections(seen, bad_ips):
 
 def run_sensor():
     init_db()
+    integrity_baseline = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    integrity_reported = False
+    last_integrity_check = time.monotonic()
     observer = Observer()
     file_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cti-file")
     handler = FileEvents(file_workers)
@@ -573,6 +576,30 @@ def run_sensor():
     bad_ips = load_feodo_ips()
     try:
         while True:
+            if not integrity_reported and time.monotonic() - last_integrity_check >= 15:
+                last_integrity_check = time.monotonic()
+                try:
+                    current_integrity = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+                except OSError as error:
+                    current_integrity = ""
+                    integrity_error = type(error).__name__
+                else:
+                    integrity_error = ""
+                if current_integrity != integrity_baseline:
+                    details = (
+                        "The endpoint sensor program file changed while this sensor process was running. "
+                        "This may be a legitimate update; verify the change and restart from a trusted copy. "
+                        f"Integrity before={integrity_baseline}; after={current_integrity or integrity_error}."
+                    )
+                    save_event(
+                        "sensor_integrity_change",
+                        "Critical",
+                        "Endpoint sensor code changed during execution",
+                        risk_score=100,
+                        details=details,
+                    )
+                    print("CRITICAL: Sensor integrity changed; a local security event was recorded.")
+                    integrity_reported = True
             previous = observe_new_processes(previous)
             if time.monotonic() - last_app_scan >= APP_SCAN_SECONDS:
                 installed_apps = observe_new_installed_apps(installed_apps)

@@ -67,6 +67,36 @@ ALERT_CHECKLIST_ITEMS = (
     ("contain_if_confirmed", "If the threat is confirmed, follow your approved process to contain the host or block the indicator."),
     ("document_decision", "Record evidence and the investigation outcome before updating the alert status."),
 )
+RESPONSE_PLAYBOOKS = {
+    "network": (
+        "Confirm the destination IP, port, process, and connection time.",
+        "Check the destination with the configured threat intelligence sources.",
+        "Review nearby DNS, process, and authentication events for the same time window.",
+        "If confirmed, follow your approved network containment procedure.",
+        "Record the evidence, owner, and final disposition in the incident timeline.",
+    ),
+    "file": (
+        "Verify the file path, signer, creation time, and SHA-256 hash locally.",
+        "Check the hash using an approved reputation source; do not upload confidential files.",
+        "Review the process that created or launched the file and nearby events.",
+        "If confirmed, follow your approved quarantine and recovery procedure.",
+        "Record evidence and final disposition in the incident timeline.",
+    ),
+    "process": (
+        "Verify the process name, parent process, user, and start time.",
+        "Check its executable location and signature using trusted local tools.",
+        "Review its network connections and related file or login events.",
+        "If confirmed, follow your approved host containment procedure.",
+        "Record evidence and final disposition in the incident timeline.",
+    ),
+    "default": (
+        "Confirm the event time, affected sensor, and alert evidence.",
+        "Correlate related events, alerts, and indicators for the same period.",
+        "Check the alert's MITRE ATT&CK mapping and validate it against evidence.",
+        "Escalate or contain only under your approved incident response process.",
+        "Document the investigation result and notify the assigned analyst.",
+    ),
+}
 FEED_COLUMNS = [
     "first_seen_utc",
     "dst_ip",
@@ -635,7 +665,10 @@ def init_database():
                 source_event_id TEXT,
                 status TEXT NOT NULL DEFAULT 'Open',
                 assigned_to TEXT NOT NULL DEFAULT '',
-                due_at TEXT
+                due_at TEXT,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                last_seen_at TEXT,
+                dedupe_key TEXT
             )"""
         )
         alert_columns = {
@@ -647,13 +680,41 @@ def init_database():
             connection.execute("ALTER TABLE alerts ADD COLUMN assigned_to TEXT NOT NULL DEFAULT ''")
         if "due_at" not in alert_columns:
             connection.execute("ALTER TABLE alerts ADD COLUMN due_at TEXT")
+        if "occurrence_count" not in alert_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN occurrence_count INTEGER NOT NULL DEFAULT 1")
+        if "last_seen_at" not in alert_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN last_seen_at TEXT")
+        if "dedupe_key" not in alert_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN dedupe_key TEXT")
+        connection.execute("UPDATE alerts SET last_seen_at = created_at WHERE last_seen_at IS NULL")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_due_at ON alerts(due_at)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_dedupe ON alerts(dedupe_key, last_seen_at)")
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_source_event_id "
             "ON alerts(source_event_id)"
         )
         connection.execute(
             "CREATE TABLE IF NOT EXISTS app_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS suppression_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_type TEXT NOT NULL,
+                rule_value TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                expires_at TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(rule_type, rule_value)
+            )"""
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_suppression_rules_expiry ON suppression_rules(expires_at)")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS suppression_matches (
+                event_id TEXT PRIMARY KEY,
+                rule_id INTEGER NOT NULL,
+                first_seen_at TEXT NOT NULL
+            )"""
         )
         connection.execute(
             """CREATE TABLE IF NOT EXISTS alert_timeline (
@@ -747,6 +808,28 @@ def init_database():
             )"""
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS response_playbook_progress (
+                alert_id INTEGER NOT NULL,
+                step_key TEXT NOT NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (alert_id, step_key)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS scheduled_reports (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                cadence TEXT NOT NULL DEFAULT 'Daily',
+                send_time_utc TEXT NOT NULL DEFAULT '09:00',
+                recipient TEXT NOT NULL DEFAULT '',
+                last_sent_at TEXT,
+                last_attempt_slot TEXT,
+                last_error TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        connection.execute("INSERT OR IGNORE INTO scheduled_reports (id) VALUES (1)")
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 occurred_at TEXT NOT NULL,
@@ -767,11 +850,109 @@ def audit_event(action, details="", username=None):
         )
 
 
+def save_app_state(key, value):
+    with connect_db() as connection:
+        connection.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(key), str(value)),
+        )
+
+
+def read_app_state(key, default=""):
+    with connect_db() as connection:
+        row = connection.execute("SELECT value FROM app_state WHERE key = ?", (str(key),)).fetchone()
+    return row[0] if row else default
+
+
 def load_alerts():
     with connect_db() as connection:
         return pd.read_sql_query(
             "SELECT * FROM alerts ORDER BY id DESC", connection
         )
+
+
+def configured_accounts():
+    """Read role accounts from private app settings; never persist passwords."""
+    accounts = []
+    admin_user = setting("APP_ADMIN_USERNAME")
+    admin_password = setting("APP_ADMIN_PASSWORD")
+    if not (admin_user and admin_password):
+        admin_user, admin_password = setting("APP_USERNAME"), setting("APP_PASSWORD")
+    if admin_user and admin_password:
+        accounts.append((admin_user, admin_password, "Admin"))
+    analyst_user, analyst_password = setting("APP_ANALYST_USERNAME"), setting("APP_ANALYST_PASSWORD")
+    if analyst_user and analyst_password and analyst_user != admin_user:
+        accounts.append((analyst_user, analyst_password, "Analyst"))
+    return accounts
+
+
+def is_admin():
+    return str(st.session_state.get("user_role", "Analyst")).lower() == "admin"
+
+
+def require_admin():
+    if is_admin():
+        return True
+    st.error("Administrator access is required for this settings page.")
+    st.info("Sign in with an Admin account, or ask the workspace administrator to configure this change.")
+    return False
+
+
+def load_suppression_rules(active_only=False):
+    query = "SELECT * FROM suppression_rules"
+    if active_only:
+        query += " WHERE enabled = 1 AND (expires_at IS NULL OR expires_at = '' OR expires_at >= date('now'))"
+    query += " ORDER BY id DESC"
+    with connect_db() as connection:
+        return pd.read_sql_query(query, connection)
+
+
+def matching_suppression_rule(event, rules=None):
+    rules = rules if rules is not None else load_suppression_rules(active_only=True)
+    if rules.empty:
+        return None
+    event = event if isinstance(event, dict) else dict(event)
+    file_name = str(event.get("file_name") or event.get("file_path") or "").strip()
+    actual = {
+        "process": str(event.get("process_name") or "").strip().lower(),
+        "remote_ip": str(event.get("remote_ip") or "").strip().lower(),
+        "extension": Path(file_name).suffix.lower(),
+        "event_type": str(event.get("event_type") or "").strip().lower(),
+    }
+    for rule in rules.to_dict("records"):
+        kind = str(rule.get("rule_type") or "")
+        value = str(rule.get("rule_value") or "").strip().lower()
+        if kind in actual and value and actual[kind] == value:
+            return rule
+    return None
+
+
+def record_suppression_match(event_id, rule):
+    if not event_id or not rule:
+        return False
+    with connect_db() as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO suppression_matches (event_id, rule_id, first_seen_at) VALUES (?, ?, ?)",
+            (str(event_id)[:200], int(rule["id"]), datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+        if cursor.rowcount:
+            row = connection.execute("SELECT value FROM app_state WHERE key='suppressed_event_total'").fetchone()
+            total = int(row[0]) if row and str(row[0]).isdigit() else 0
+            connection.execute(
+                "INSERT INTO app_state (key, value) VALUES ('suppressed_event_total', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(total + 1),),
+            )
+            return True
+    return False
+
+
+def alert_fingerprint(title, severity):
+    normalized = str(title or "").strip().lower()
+    normalized = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", normalized)
+    normalized = re.sub(r"\b[a-f0-9]{32,128}\b", "<hash>", normalized)
+    normalized = re.sub(r"\b\d+\b", "<n>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return hashlib.sha256(f"{str(severity).lower()}|{normalized}".encode("utf-8")).hexdigest()
 
 
 def record_alert_timeline(alert_id, event_type, note="", actor=None):
@@ -969,10 +1150,15 @@ def sync_watchlist_alerts(events):
     watchlist = load_ioc_watchlist(enabled_only=True)
     if watchlist.empty:
         return 0
+    rules = load_suppression_rules(active_only=True)
     created = 0
     for event in events.to_dict("records"):
         event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
         if not event_id:
+            continue
+        rule = matching_suppression_rule(event, rules)
+        if rule:
+            record_suppression_match(event_id, rule)
             continue
         fields = {
             "ip address": [event.get("remote_ip", "")],
@@ -1010,6 +1196,8 @@ def sync_watchlist_alerts(events):
 
 def render_ioc_watchlist():
     render_page_heading("IOC Watchlist")
+    if not require_admin():
+        return
     st.write("Keep IP addresses, domains, and file hashes you want the sensor events checked against.")
     st.caption("Matches create deduplicated alerts when endpoint metadata or an authorized local log contains the indicator. The sensor currently records IPs and file hashes; domain matches are available in text/log evidence where the domain is present.")
     with st.form("ioc_watchlist_add_form", clear_on_submit=True):
@@ -1102,9 +1290,9 @@ def notify_security_alert(severity, title):
         st.warning(f"Email alert could not be sent: {error}")
 
 
-def send_security_email(subject, body):
+def send_security_email(subject, body, recipient_override=None):
     """Send email through a provider API or SMTP, using private settings."""
-    recipient = setting("ALERT_EMAIL_TO")
+    recipient = str(recipient_override or setting("ALERT_EMAIL_TO")).strip()
     username, password = setting("SMTP_USERNAME"), setting("SMTP_PASSWORD")
     provider = setting("EMAIL_PROVIDER", "smtp").strip().lower()
     sender = setting("RESEND_FROM", setting("SMTP_FROM", username)) if provider == "resend" else setting("SMTP_FROM", username)
@@ -1198,14 +1386,31 @@ def send_security_email(subject, body):
 
 def add_alert(title, severity, details, mitre_id="", source_event_id=None):
     alert_id = None
+    grouped_alert = None
+    dedupe_key = alert_fingerprint(title, severity)
     with connect_db() as connection:
         created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if source_event_id:
+            if connection.execute("SELECT 1 FROM alerts WHERE source_event_id = ?", (source_event_id,)).fetchone():
+                return False
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")
+        grouped_alert = connection.execute(
+            "SELECT id, occurrence_count FROM alerts WHERE dedupe_key = ? AND status IN ('Open', 'Acknowledged') AND last_seen_at >= ? ORDER BY id DESC LIMIT 1",
+            (dedupe_key, cutoff),
+        ).fetchone()
+        if grouped_alert:
+            alert_id = int(grouped_alert[0])
+            occurrence_count = int(grouped_alert[1] or 1) + 1
+            connection.execute(
+                "UPDATE alerts SET occurrence_count = ?, last_seen_at = ? WHERE id = ?",
+                (occurrence_count, created_at, alert_id),
+            )
+        elif source_event_id:
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO alerts
-                   (created_at, title, severity, details, mitre_id, source_event_id, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'Open')""",
-                (created_at, title, severity, details, mitre_id, source_event_id),
+                   (created_at, title, severity, details, mitre_id, source_event_id, status, occurrence_count, last_seen_at, dedupe_key)
+                   VALUES (?, ?, ?, ?, ?, ?, 'Open', 1, ?, ?)""",
+                (created_at, title, severity, details, mitre_id, source_event_id, created_at, dedupe_key),
             )
             if cursor.rowcount == 0:
                 return False
@@ -1213,11 +1418,15 @@ def add_alert(title, severity, details, mitre_id="", source_event_id=None):
         else:
             cursor = connection.execute(
                 """INSERT INTO alerts
-                   (created_at, title, severity, details, mitre_id, status)
-                   VALUES (?, ?, ?, ?, ?, 'Open')""",
-                (created_at, title, severity, details, mitre_id),
+                   (created_at, title, severity, details, mitre_id, status, occurrence_count, last_seen_at, dedupe_key)
+                   VALUES (?, ?, ?, ?, ?, 'Open', 1, ?, ?)""",
+                (created_at, title, severity, details, mitre_id, created_at, dedupe_key),
             )
             alert_id = int(cursor.lastrowid)
+    if grouped_alert:
+        record_alert_timeline(alert_id, "Repeated alert grouped", f"Another matching signal was grouped into this alert. Occurrence count: {occurrence_count}.")
+        audit_event("alert_occurrence_grouped", f"alert_id={alert_id}; occurrence_count={occurrence_count}")
+        return False
     record_alert_timeline(alert_id, "Alert created", f"{severity}: {title}\n{details}")
     audit_event("alert_created", f"severity={severity}; title={title[:150]}")
     notify_security_alert(severity, title)
@@ -1263,7 +1472,7 @@ def save_alert_checklist(alert_id, checked_items):
 
 
 def sync_endpoint_alerts(events):
-    """Turn endpoint events marked for review into deduplicated alerts."""
+    """Turn endpoint events into deduplicated alerts unless an active rule suppresses them."""
     if events is None or events.empty or "severity" not in events.columns:
         return 0
 
@@ -1277,80 +1486,45 @@ def sync_endpoint_alerts(events):
         return str(result).strip()
 
     inserted = 0
-    notifications = []
-    audit_rows = []
-    timeline_rows = []
-    with connect_db() as connection:
-        for event in events.to_dict("records"):
-            event_severity = value(event, "severity").title()
-            if event_severity not in severity_map:
-                continue
-            try:
-                event_risk = int(float(value(event, "risk_score", "0")))
-            except (TypeError, ValueError):
-                event_risk = 0
-            if event_severity not in {"High", "Critical"} and event_risk < min_risk:
-                continue
-
-            event_id = value(event, "event_id")
-            if not event_id:
-                event_id = value(event, "event_uid") or value(event, "id")
-            if not event_id:
-                continue
-
-            summary = value(event, "summary", "Endpoint event needs review")
-            event_type = value(event, "event_type", "endpoint_event")
-            occurred_at = value(
-                event,
-                "occurred_at",
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            )
-            risk_score = value(event, "risk_score", "0")
-            details = [
-                "Source: Windows endpoint sensor",
-                f"Event type: {event_type}",
-                f"Risk score: {risk_score}/100",
-                f"Signal: {summary}",
-            ]
-            for key, label in (
-                ("file_name", "File"),
-                ("folder", "Folder"),
-                ("process_name", "Process"),
-                ("remote_ip", "Remote IP"),
-                ("remote_port", "Remote port"),
-                ("details", "Assessment"),
-            ):
-                item = value(event, key)
-                if item:
-                    details.append(f"{label}: {item}")
-            candidates = map_signal_to_mitre(" ".join([event_type, summary, *details]))
-            mitre_id = candidates[0]["Technique ID"] if candidates else ""
-
-            cursor = connection.execute(
-                """INSERT OR IGNORE INTO alerts
-                   (created_at, title, severity, details, mitre_id,
-                    source_event_id, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'Open')""",
-                (
-                    occurred_at,
-                    f"Endpoint signal: {summary}",
-                    severity_map[event_severity],
-                    "\n".join(details),
-                    mitre_id,
-                    f"endpoint:{event_id}",
-                ),
-            )
-            inserted += max(cursor.rowcount, 0)
-            if cursor.rowcount > 0:
-                timeline_rows.append((int(cursor.lastrowid), event_severity, summary, details))
-                notifications.append((severity_map[event_severity], f"Endpoint signal: {summary}"))
-                audit_rows.append(f"severity={severity_map[event_severity]}; event_id={event_id}")
-    for alert_id, severity, summary, details in timeline_rows:
-        record_alert_timeline(alert_id, "Alert created", f"{severity}: {summary}\n{details}")
-    for detail in audit_rows:
-        audit_event("endpoint_alert_created", detail)
-    for severity, title in notifications:
-        notify_security_alert(severity, title)
+    suppressed_count = 0
+    rules = load_suppression_rules(active_only=True)
+    for event in events.to_dict("records"):
+        event_severity = value(event, "severity").title()
+        if event_severity not in severity_map:
+            continue
+        try:
+            event_risk = int(float(value(event, "risk_score", "0")))
+        except (TypeError, ValueError):
+            event_risk = 0
+        if event_severity not in {"High", "Critical"} and event_risk < min_risk:
+            continue
+        event_id = value(event, "event_id") or value(event, "event_uid") or value(event, "id")
+        if not event_id:
+            continue
+        rule = matching_suppression_rule(event, rules)
+        if rule:
+            suppressed_count += int(record_suppression_match(event_id, rule))
+            continue
+        summary = value(event, "summary", "Endpoint event needs review")
+        event_type = value(event, "event_type", "endpoint_event")
+        details = [
+            "Source: Windows endpoint sensor",
+            f"Event type: {event_type}",
+            f"Risk score: {event_risk}/100",
+            f"Signal: {summary}",
+        ]
+        for key, label in (("file_name", "File"), ("folder", "Folder"), ("process_name", "Process"), ("remote_ip", "Remote IP"), ("remote_port", "Remote port"), ("details", "Assessment")):
+            item = value(event, key)
+            if item:
+                details.append(f"{label}: {item}")
+        candidates = map_signal_to_mitre(" ".join([event_type, summary, *details]))
+        mitre_id = candidates[0]["Technique ID"] if candidates else ""
+        inserted += int(add_alert(
+            f"Endpoint signal: {summary}", severity_map[event_severity], "\n".join(details),
+            mitre_id=mitre_id, source_event_id=f"endpoint:{event_id}",
+        ))
+    if suppressed_count:
+        audit_event("endpoint_events_suppressed", f"new_unique_events={suppressed_count}")
     return inserted
 
 
@@ -1713,12 +1887,18 @@ def render_dashboard_alert_inbox():
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_feodo_feed():
-    response = requests.get(
-        FEODO_FEED_URL,
-        timeout=15,
-        headers={"User-Agent": "Local-CTI/1.0"},
-    )
-    response.raise_for_status()
+    attempted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        response = requests.get(
+            FEODO_FEED_URL,
+            timeout=15,
+            headers={"User-Agent": "Local-CTI/1.0"},
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        save_app_state("threat_feed_last_attempt_at", attempted_at)
+        save_app_state("threat_feed_last_error", f"{type(error).__name__}: {error}"[:500])
+        raise
     try:
         feed = pd.read_csv(
             StringIO(response.text),
@@ -1731,6 +1911,10 @@ def load_feodo_feed():
 
     if "dst_ip" in feed.columns:
         feed["dst_ip"] = feed["dst_ip"].astype(str).str.strip()
+    save_app_state("threat_feed_last_success_at", attempted_at)
+    save_app_state("threat_feed_last_attempt_at", attempted_at)
+    save_app_state("threat_feed_indicator_count", len(feed))
+    save_app_state("threat_feed_last_error", "")
     return feed
 
 
@@ -2637,60 +2821,36 @@ def create_ai_anomaly_alerts(events):
     if events is None or events.empty:
         return 0
     inserted = 0
-    notifications = []
-    audit_rows = []
-    timeline_rows = []
     settings = get_detection_settings()
-    with connect_db() as connection:
-        for event in events.to_dict("records"):
-            event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
-            if not event_id:
-                continue
-            score = int(event.get("AI risk score", event.get("AI anomaly score", 0)) or 0)
-            sensor_severity = str(event.get("severity") or "").title()
-            if score < settings["endpoint_alert_min_risk"] or int(event.get("AI anomaly score", 0) or 0) < settings["ai_anomaly_min_score"]:
-                continue
-            severity = str(event.get("AI severity") or ("Critical" if sensor_severity == "Critical" else "High" if score >= 70 or sensor_severity == "High" else "Medium"))
-            summary = str(event.get("summary") or event.get("event_type") or "Endpoint anomaly")
-            details = "\n".join([
-                "Source: live endpoint metadata anomaly model",
-                f"Combined AI risk score: {score}/100",
-                f"Sensor severity: {sensor_severity or 'Unknown'}",
-                f"AI indicators: {event.get('AI indicators', 'Review event metadata')}",
-                f"Event: {summary}",
-                "Analyst review is required; an anomaly score is not a malware verdict.",
-            ])
-            candidates = map_signal_to_mitre(f"{summary} {details}")
-            mitre_id = candidates[0]["Technique ID"] if candidates else ""
-            cursor = connection.execute(
-                """INSERT OR IGNORE INTO alerts
-                   (created_at, title, severity, details, mitre_id, source_event_id, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'Open')""",
-                (
-                    str(event.get("occurred_at") or event.get("created_at") or datetime.now(timezone.utc).isoformat(timespec="seconds")),
-                    f"AI anomaly: {summary[:120]}",
-                    severity,
-                    details,
-                    mitre_id,
-                    f"ai-endpoint:{event_id}",
-                ),
-            )
-            inserted += max(cursor.rowcount, 0)
-            if cursor.rowcount > 0:
-                timeline_rows.append((
-                    int(cursor.lastrowid),
-                    severity,
-                    f"AI anomaly: {summary[:120]}",
-                    details,
-                ))
-                notifications.append((severity, f"AI anomaly: {summary[:120]}"))
-                audit_rows.append(f"severity={severity}; event_id={event_id}; score={score}")
-    for alert_id, severity, title, details in timeline_rows:
-        record_alert_timeline(alert_id, "Alert created", f"{severity}: {title}\n{details}")
-    for detail in audit_rows:
-        audit_event("ai_anomaly_alert_created", detail)
-    for severity, title in notifications:
-        notify_security_alert(severity, title)
+    rules = load_suppression_rules(active_only=True)
+    for event in events.to_dict("records"):
+        event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
+        if not event_id:
+            continue
+        rule = matching_suppression_rule(event, rules)
+        if rule:
+            record_suppression_match(event_id, rule)
+            continue
+        score = int(event.get("AI risk score", event.get("AI anomaly score", 0)) or 0)
+        sensor_severity = str(event.get("severity") or "").title()
+        if score < settings["endpoint_alert_min_risk"] or int(event.get("AI anomaly score", 0) or 0) < settings["ai_anomaly_min_score"]:
+            continue
+        severity = str(event.get("AI severity") or ("Critical" if sensor_severity == "Critical" else "High" if score >= 70 or sensor_severity == "High" else "Medium"))
+        summary = str(event.get("summary") or event.get("event_type") or "Endpoint anomaly")
+        details = "\n".join([
+            "Source: live endpoint metadata anomaly model",
+            f"Combined AI risk score: {score}/100",
+            f"Sensor severity: {sensor_severity or 'Unknown'}",
+            f"AI indicators: {event.get('AI indicators', 'Review event metadata')}",
+            f"Event: {summary}",
+            "Analyst review is required; an anomaly score is not a malware verdict.",
+        ])
+        candidates = map_signal_to_mitre(f"{summary} {details}")
+        mitre_id = candidates[0]["Technique ID"] if candidates else ""
+        inserted += int(add_alert(
+            f"AI anomaly: {summary[:120]}", severity, details, mitre_id=mitre_id,
+            source_event_id=f"ai-endpoint:{event_id}",
+        ))
     return inserted
 
 
@@ -3037,7 +3197,10 @@ def render_alert_system():
     configured_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
     default_index = severity_levels.index(configured_threshold) if configured_threshold in severity_levels else 1
     notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
-    render_local_email_settings()
+    if is_admin():
+        render_local_email_settings()
+    else:
+        st.caption("Email delivery settings can be changed by an Admin.")
     email_provider = setting("EMAIL_PROVIDER", "smtp").strip().lower()
     sender_setting = setting("RESEND_FROM", setting("SMTP_FROM")) if email_provider == "resend" else setting("SMTP_FROM")
     sender_address = parseaddr(sender_setting)[1]
@@ -3051,8 +3214,8 @@ def render_alert_system():
     email_enabled = st.toggle(
         "Email notifications",
         key="email_alerts_enabled_this_session",
-        disabled=not configured_for_email,
-        help="This switch resets to OFF whenever you restart the app or sign in again.",
+        disabled=not configured_for_email or not is_admin(),
+        help="This switch resets to OFF whenever you restart the app or sign in again. Admin access is required.",
     )
     if configured_for_email:
         st.caption("Email notifications start OFF each session. Turn this on only when you want email alerts; restart or sign out to switch them off.")
@@ -3114,7 +3277,10 @@ def render_alert_system():
         return
 
     active_count = int(alerts["status"].isin(["Open", "Acknowledged"]).sum())
-    if st.button("Clear all notifications", disabled=active_count == 0, type="secondary"):
+    if "occurrence_count" in alerts.columns:
+        grouped_observations = int(pd.to_numeric(alerts["occurrence_count"], errors="coerce").fillna(1).sum())
+        st.caption(f"{len(alerts)} alert group(s) represent {grouped_observations} observed signal(s). Matching open alerts are grouped for 15 minutes.")
+    if is_admin() and st.button("Clear all notifications", disabled=active_count == 0, type="secondary"):
         cleared_count = clear_all_notifications()
         st.session_state["notifications_cleared_message"] = (
             f"Cleared {cleared_count} notification(s). New alerts will still appear."
@@ -3147,6 +3313,7 @@ def render_alert_system():
         st.rerun()
 
     selected_alert = visible.loc[visible["id"].astype(int) == int(selected_id)].iloc[0]
+    st.caption(f"Grouped observations: {int(selected_alert.get('occurrence_count', 1) or 1)} · Last observed: {selected_alert.get('last_seen_at') or selected_alert.get('created_at')}")
     if str(selected_alert.get("SLA status", "")) == "OVERDUE":
         st.error("This alert has passed its review deadline.")
     with st.form(f"alert_assignment_sla_form_{selected_id}"):
@@ -3191,6 +3358,8 @@ def render_alert_system():
         )
         st.success("Investigation checklist progress saved for this alert.")
         st.rerun()
+
+    render_response_playbook(selected_alert)
 
     st.markdown("#### Investigation timeline")
     note_key = f"alert_investigation_note_{selected_id}"
@@ -3793,6 +3962,351 @@ def render_config_backup_restore():
         st.error(f"Could not restore this configuration: {error}")
 
 
+def render_asset_inventory():
+    render_page_heading("Asset Inventory")
+    st.write("Review endpoint sensors and the processes, installed-application events, and network activity they have reported.")
+    st.caption("This is an observed inventory from sensor telemetry, not a complete software scan. Only the current event window is available.")
+    try:
+        events, source = load_sensor_events(limit=10000)
+    except Exception as error:
+        st.error(f"Could not load endpoint inventory: {type(error).__name__}")
+        return
+    try:
+        sensors, heartbeat_source = load_cloud_sensor_heartbeats()
+    except Exception:
+        sensors, heartbeat_source = [], "unavailable"
+    if events is None:
+        events = pd.DataFrame()
+    sensor_rows = []
+    if not events.empty:
+        if "sensor_id" not in events:
+            events["sensor_id"] = "Local sensor"
+        time_col = next((name for name in ("occurred_at", "created_at") if name in events), None)
+        for sensor_id, group in events.groupby("sensor_id", dropna=False):
+            times = pd.to_datetime(group[time_col], utc=True, errors="coerce") if time_col else pd.Series(dtype="datetime64[ns, UTC]")
+            processes = sorted(set(group.get("process_name", pd.Series(dtype=str)).dropna().astype(str)) - {""})
+            types = group.get("event_type", pd.Series("", index=group.index)).fillna("").astype(str)
+            apps = sorted(set(group.loc[types.eq("application_installed"), "summary"].dropna().astype(str)))
+            risks = pd.to_numeric(group.get("risk_score", pd.Series(0, index=group.index)), errors="coerce").fillna(0)
+            sensor_rows.append({
+                "Sensor ID": str(sensor_id),
+                "Status": "Online" if time_col and not times.dropna().empty and (datetime.now(timezone.utc) - times.max().to_pydatetime()).total_seconds() <= 45 else "No recent event",
+                "Latest event (UTC)": times.max().isoformat() if not times.dropna().empty else "Unknown",
+                "Observed events": len(group),
+                "Distinct processes": len(processes),
+                "Installed-app events": len(apps),
+                "Network events": int(types.str.startswith("network").sum()),
+                "Highest observed risk": int(risks.max()) if len(risks) else 0,
+            })
+    for item in sensors:
+        sensor_id = str(item.get("sensor_id") or "")
+        if any(row["Sensor ID"] == sensor_id for row in sensor_rows):
+            continue
+        seen = pd.to_datetime(item.get("last_seen_at"), utc=True, errors="coerce")
+        sensor_rows.append({
+            "Sensor ID": sensor_id,
+            "Status": "Online" if not pd.isna(seen) and (datetime.now(timezone.utc) - seen.to_pydatetime()).total_seconds() <= 45 else "Offline",
+            "Latest event (UTC)": item.get("last_event_at") or "Unknown",
+            "Observed events": 0, "Distinct processes": 0, "Installed-app events": 0, "Network events": 0, "Highest observed risk": 0,
+        })
+    heartbeat_by_id = {str(item.get("sensor_id") or ""): item for item in sensors}
+    local_report = sensor_health_report(events, source) if source != "cloud" else None
+    for row in sensor_rows:
+        heartbeat = heartbeat_by_id.get(row["Sensor ID"])
+        if heartbeat:
+            seen = pd.to_datetime(heartbeat.get("last_seen_at"), utc=True, errors="coerce")
+            age = (datetime.now(timezone.utc) - seen.to_pydatetime()).total_seconds() if not pd.isna(seen) else float("inf")
+            row["Status"] = "Online" if age <= 45 else "Offline"
+            row["Last heartbeat (UTC)"] = heartbeat.get("last_seen_at") or "Unknown"
+        elif local_report is not None:
+            local_status = str(local_report.get("status", "Unknown"))
+            row["Status"] = "Online" if local_status == "Online" else "Offline" if local_status.lower().startswith(("offline", "stopped")) else local_status
+            row["Last heartbeat (UTC)"] = local_report.get("last_heartbeat", "Unknown")
+        else:
+            row["Last heartbeat (UTC)"] = "Local heartbeat"
+    st.caption(f"Event source: {source} · Heartbeat source: {heartbeat_source} · Visible sensors: {len(sensor_rows)}")
+    if not sensor_rows:
+        st.info("No sensor inventory is available yet. Start the endpoint sensor and wait for its first event or heartbeat.")
+        return
+    st.dataframe(pd.DataFrame(sensor_rows), hide_index=True, width="stretch")
+    if not events.empty:
+        process_rows = events[events.get("process_name", pd.Series("", index=events.index)).notna()].copy()
+        if not process_rows.empty:
+            st.markdown("#### Recently observed processes")
+            st.dataframe(process_rows[[column for column in ("sensor_id", "occurred_at", "process_name", "event_type", "remote_ip", "risk_score") if column in process_rows]].head(300), hide_index=True, width="stretch")
+        app_rows = events[events.get("event_type", pd.Series("", index=events.index)).astype(str).eq("application_installed")]
+        if not app_rows.empty:
+            st.markdown("#### Installed-application events")
+            st.dataframe(app_rows[[column for column in ("sensor_id", "occurred_at", "summary", "details") if column in app_rows]].head(300), hide_index=True, width="stretch")
+        st.download_button("Download observed inventory (CSV)", pd.DataFrame(sensor_rows).to_csv(index=False).encode("utf-8-sig"), "observed_asset_inventory.csv", "text/csv")
+
+
+def render_suppression_rules():
+    render_page_heading("Alert Suppression")
+    if not require_admin():
+        return
+    st.write("Reduce repeated, approved activity from alert creation. Rules are exact matches and can expire automatically.")
+    with st.form("suppression_rule_form", clear_on_submit=True):
+        rule_type = st.selectbox("Match field", ["process", "remote_ip", "extension", "event_type"])
+        rule_value = st.text_input("Exact value", max_chars=260)
+        reason = st.text_input("Why this activity is trusted", max_chars=300)
+        has_expiry = st.checkbox("Set an expiry date", value=True)
+        expires_at = st.date_input("Rule expires (UTC)", value=datetime.now(timezone.utc).date() + timedelta(days=30), disabled=not has_expiry)
+        submitted = st.form_submit_button("Save suppression rule")
+    if submitted:
+        value = rule_value.strip().lower()
+        try:
+            if rule_type == "remote_ip":
+                value = str(ipaddress.ip_address(value))
+            elif rule_type == "extension":
+                value = value if value.startswith(".") else f".{value}"
+                if not re.fullmatch(r"\.[a-z0-9]{1,12}", value):
+                    raise ValueError("Enter a file extension such as .log or .exe.")
+            elif not value or len(value) > 260 or any(ord(character) < 32 for character in value):
+                raise ValueError("Enter a valid exact process or event-type value.")
+            if not reason.strip():
+                raise ValueError("Add a reason so analysts know why the activity is trusted.")
+            expiry = expires_at.isoformat() if has_expiry else None
+            with connect_db() as connection:
+                connection.execute(
+                    """INSERT INTO suppression_rules (rule_type, rule_value, reason, expires_at, enabled, created_at)
+                       VALUES (?, ?, ?, ?, 1, ?)
+                       ON CONFLICT(rule_type, rule_value) DO UPDATE SET reason=excluded.reason, expires_at=excluded.expires_at, enabled=1""",
+                    (rule_type, value, reason.strip(), expiry, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                )
+            audit_event("suppression_rule_saved", f"type={rule_type}; value={value}; expires={expiry or 'never'}")
+            st.success("Suppression rule saved. Matching new endpoint and IOC alerts will be suppressed until it expires or is disabled.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+    rules = load_suppression_rules()
+    with connect_db() as connection:
+        count_row = connection.execute("SELECT value FROM app_state WHERE key='suppressed_event_total'").fetchone()
+    st.metric("Endpoint events suppressed since this database was created", int(count_row[0]) if count_row and str(count_row[0]).isdigit() else 0)
+    if rules.empty:
+        st.info("No suppression rules are configured.")
+        return
+    today = datetime.now(timezone.utc).date().isoformat()
+    display = rules.copy()
+    display["Status"] = display.apply(lambda row: "Expired" if row.get("expires_at") and str(row["expires_at"]) < today else "Active" if row.get("enabled") else "Disabled", axis=1)
+    st.dataframe(display.rename(columns={"rule_type":"Match field","rule_value":"Exact value","reason":"Reason","expires_at":"Expires (UTC)","created_at":"Created (UTC)"})[["id","Match field","Exact value","Reason","Expires (UTC)","Status"]], hide_index=True, width="stretch")
+    selected = st.selectbox("Rule to manage", rules["id"].astype(int).tolist(), key="suppression_rule_selected")
+    selected_row = rules.loc[rules["id"] == selected].iloc[0]
+    left, right = st.columns(2)
+    with left:
+        if st.button("Disable rule" if bool(selected_row["enabled"]) else "Enable rule", key="suppression_rule_toggle"):
+            with connect_db() as connection:
+                connection.execute("UPDATE suppression_rules SET enabled=? WHERE id=?", (0 if bool(selected_row["enabled"]) else 1, int(selected)))
+            audit_event("suppression_rule_toggled", f"id={selected}; enabled={not bool(selected_row['enabled'])}")
+            st.rerun()
+    with right:
+        if st.button("Delete rule", key="suppression_rule_delete"):
+            with connect_db() as connection:
+                connection.execute("DELETE FROM suppression_rules WHERE id=?", (int(selected),))
+            audit_event("suppression_rule_deleted", f"id={selected}")
+            st.rerun()
+
+
+def render_access_roles():
+    render_page_heading("Access & Roles")
+    if not require_admin():
+        return
+    st.write("Accounts and passwords are read from private app settings. Passwords are never saved in the project database.")
+    accounts = configured_accounts()
+    if not accounts:
+        st.error("No role accounts are configured. Add an Admin username and password to the private settings.")
+        return
+    st.dataframe(pd.DataFrame([{"Username": user, "Role": role, "Password stored": "Private settings only"} for user, _password, role in accounts]), hide_index=True, width="stretch")
+    st.markdown("#### Configure accounts")
+    st.write("Set these values in local .streamlit/secrets.toml or Streamlit Cloud App settings → Secrets. The legacy APP_USERNAME / APP_PASSWORD pair is treated as an Admin account.")
+    st.code('APP_ADMIN_USERNAME = "admin-name"\nAPP_ADMIN_PASSWORD = "use-a-long-unique-password"\nAPP_ANALYST_USERNAME = "analyst-name"\nAPP_ANALYST_PASSWORD = "use-a-different-long-password"')
+    st.markdown("#### Permissions")
+    st.dataframe(pd.DataFrame([
+        {"Role": "Admin", "Access": "All modules; manage suppression rules, scheduled reports, role settings, detection tuning, and configuration backups."},
+        {"Role": "Analyst", "Access": "Review telemetry, investigate alerts/incidents, use response playbooks, and export reports."},
+    ]), hide_index=True, width="stretch")
+    st.caption("After changing account Secrets, restart the desktop app or let Streamlit Cloud redeploy. Role separation applies to the app UI; use network access controls for the host/API.")
+
+
+def alert_playbook_kind(alert):
+    text = f"{alert.get('title', '')} {alert.get('details', '')}".lower()
+    if any(token in text for token in ("network_connection", "remote ip", "destination", "watchlist match", "c2")):
+        return "network"
+    if any(token in text for token in ("file_", "sha-256", "sha256", "file hash", "file created")):
+        return "file"
+    if any(token in text for token in ("process_", "process name", "application_installed")):
+        return "process"
+    return "default"
+
+
+def render_response_playbook(alert):
+    kind = alert_playbook_kind(alert)
+    steps = RESPONSE_PLAYBOOKS[kind]
+    st.markdown(f"#### Response playbook · {kind.title()}")
+    st.caption("Guidance only. These steps do not block traffic, stop processes, quarantine files, or otherwise change the endpoint.")
+    with connect_db() as connection:
+        saved = {row[0]: bool(row[1]) for row in connection.execute("SELECT step_key, completed FROM response_playbook_progress WHERE alert_id = ?", (int(alert["id"]),)).fetchall()}
+    checked = {}
+    with st.form(f"response_playbook_form_{int(alert['id'])}"):
+        for index, step in enumerate(steps):
+            key = f"{kind}_{index}"
+            widget_key = f"response_playbook_{int(alert['id'])}_{key}"
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = saved.get(key, False)
+            checked[key] = st.checkbox(step, key=widget_key)
+        submitted = st.form_submit_button("Save playbook progress")
+    if submitted:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with connect_db() as connection:
+            connection.executemany(
+                """INSERT INTO response_playbook_progress (alert_id, step_key, completed, updated_at) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(alert_id, step_key) DO UPDATE SET completed=excluded.completed, updated_at=excluded.updated_at""",
+                [(int(alert["id"]), key, int(done), now) for key, done in checked.items()],
+            )
+        record_alert_timeline(int(alert["id"]), "Response playbook updated", f"{kind.title()} playbook progress: {sum(checked.values())}/{len(steps)} steps complete.")
+        audit_event("response_playbook_updated", f"alert_id={int(alert['id'])}; type={kind}; completed={sum(checked.values())}/{len(steps)}")
+        st.success("Response playbook progress saved.")
+        st.rerun()
+
+
+def load_report_schedule():
+    with connect_db() as connection:
+        row = connection.execute("SELECT enabled, cadence, send_time_utc, recipient, last_sent_at, last_attempt_slot, last_error FROM scheduled_reports WHERE id=1").fetchone()
+    return dict(zip(("enabled","cadence","send_time_utc","recipient","last_sent_at","last_attempt_slot","last_error"), row)) if row else {}
+
+
+def save_report_schedule(enabled, cadence, send_time, recipient):
+    with connect_db() as connection:
+        connection.execute("UPDATE scheduled_reports SET enabled=?, cadence=?, send_time_utc=?, recipient=?, last_error='' WHERE id=1", (int(enabled), cadence, send_time, recipient))
+    audit_event("scheduled_report_settings_saved", f"enabled={enabled}; cadence={cadence}; time_utc={send_time}; recipient={recipient[:120]}")
+
+
+@st.fragment(run_every="15m")
+def threat_feed_health_worker():
+    try:
+        load_feodo_feed()
+    except Exception:
+        pass
+    last_success = read_app_state("threat_feed_last_success_at")
+    parsed = pd.to_datetime(last_success, utc=True, errors="coerce") if last_success else pd.NaT
+    if not pd.isna(parsed) and (datetime.now(timezone.utc) - parsed.to_pydatetime()).total_seconds() > 24 * 3600:
+        add_alert(
+            "Threat intelligence feed is stale", "Medium",
+            f"Feodo Tracker last succeeded at {last_success}. Verify source connectivity before relying on this feed.",
+            source_event_id=f"feed-stale:{datetime.now(timezone.utc).date().isoformat()}",
+        )
+
+
+@st.fragment(run_every="60s")
+def scheduled_report_worker():
+    schedule = load_report_schedule()
+    if not schedule.get("enabled") or not schedule.get("recipient"):
+        return
+    try:
+        hour, minute = (int(part) for part in str(schedule["send_time_utc"]).split(":"))
+        now = datetime.now(timezone.utc)
+        sent_at = pd.to_datetime(schedule.get("last_sent_at"), utc=True, errors="coerce")
+        days = 1 if schedule.get("cadence") == "Daily" else 7
+        due_date = now.date() if pd.isna(sent_at) else sent_at.date() + timedelta(days=days)
+        due_at = datetime.combine(due_date, datetime.min.time(), tzinfo=timezone.utc).replace(hour=hour, minute=minute)
+        if now < due_at:
+            return
+        slot = now.date().isoformat()
+        if schedule.get("last_attempt_slot") == slot:
+            return
+        with connect_db() as connection:
+            claimed = connection.execute(
+                "UPDATE scheduled_reports SET last_attempt_slot=? WHERE id=1 AND (last_attempt_slot IS NULL OR last_attempt_slot != ?)",
+                (slot, slot),
+            )
+            if claimed.rowcount == 0:
+                return
+        summary, _events, _alerts = build_daily_summary(now.date())
+        body = "Scheduled security summary (UTC)\n\n" + "\n".join(f"{row['Metric']}: {row['Value']}" for row in summary.to_dict("records"))
+        try:
+            send_security_email(f"AI Cyber Threat Intelligence — {schedule['cadence'].lower()} summary", body, recipient_override=schedule["recipient"])
+            with connect_db() as connection:
+                connection.execute("UPDATE scheduled_reports SET last_sent_at=?, last_error='' WHERE id=1", (now.isoformat(timespec="seconds"),))
+            audit_event("scheduled_security_report_sent", f"cadence={schedule['cadence']}; recipient={schedule['recipient'][:120]}")
+            st.toast("Scheduled security summary sent.", icon="✉️")
+        except Exception as error:
+            with connect_db() as connection:
+                connection.execute("UPDATE scheduled_reports SET last_error=? WHERE id=1", (str(error)[:500],))
+            audit_event("scheduled_security_report_failed", f"error={str(error)[:300]}")
+    except (TypeError, ValueError, KeyError):
+        return
+
+
+def render_scheduled_reports():
+    render_page_heading("Scheduled Reports")
+    if not require_admin():
+        return
+    current = load_report_schedule()
+    st.write("Email a UTC daily or weekly security summary to an authorized recipient.")
+    provider = setting("EMAIL_PROVIDER", "smtp").lower()
+    provider_ready = bool(setting("RESEND_API_KEY")) and bool(setting("RESEND_FROM")) if provider == "resend" else bool(setting("SMTP_HOST")) and bool(setting("SMTP_FROM") or setting("SMTP_USERNAME"))
+    st.caption(f"Delivery provider: {provider} · Credentials: {'configured' if provider_ready else 'incomplete'}. This schedule is opt-in and separate from the alert email switch.")
+    if not provider_ready:
+        st.info("Configure the selected email provider in private settings before enabling scheduled delivery.")
+    with st.form("scheduled_report_settings_form"):
+        enabled = st.checkbox("Enable scheduled summary email", value=bool(current.get("enabled")))
+        cadence = st.selectbox("Frequency", ["Daily", "Weekly"], index=0 if current.get("cadence", "Daily") == "Daily" else 1)
+        send_time = st.time_input("Send after this UTC time", value=datetime.strptime(current.get("send_time_utc", "09:00"), "%H:%M").time())
+        recipient = st.text_input("Report recipient", value=current.get("recipient", ""), max_chars=254)
+        submitted = st.form_submit_button("Save schedule")
+    if submitted:
+        parsed = parseaddr(recipient.strip())[1]
+        if enabled and (parsed != recipient.strip() or any(ord(character) < 32 for character in recipient) or "@" not in parsed or "." not in parsed.rsplit("@", 1)[-1]):
+            st.error("Enter a valid report recipient email address.")
+        else:
+            save_report_schedule(enabled, cadence, send_time.strftime("%H:%M"), parsed)
+            st.success("Scheduled report settings saved.")
+            st.rerun()
+    updated = load_report_schedule()
+    st.write(f"Enabled: {'Yes' if updated.get('enabled') else 'No'} · Last sent (UTC): {updated.get('last_sent_at') or 'Never'}")
+    if updated.get("last_error"):
+        st.error(f"Last delivery failed: {updated['last_error']}")
+    st.warning("The in-app scheduler sends when this dashboard has an active session and is refreshing. It cannot guarantee delivery while the cloud app or desktop process is stopped; use an always-on mail scheduler for guaranteed delivery.")
+    if st.button("Send a scheduled-report test now", disabled=not updated.get("recipient")):
+        try:
+            summary, _events, _alerts = build_daily_summary(datetime.now(timezone.utc).date())
+            body = "Scheduled security summary test (UTC)\n\n" + "\n".join(f"{row['Metric']}: {row['Value']}" for row in summary.to_dict("records"))
+            send_security_email("AI Cyber Threat Intelligence — scheduled report test", body, recipient_override=updated["recipient"])
+            audit_event("scheduled_security_report_test_sent", f"recipient={updated['recipient'][:120]}")
+            st.success("Test summary sent.")
+        except Exception as error:
+            st.error(f"Could not send the test summary: {error}")
+
+
+def render_threat_feed_health():
+    render_page_heading("Threat Feed Health")
+    st.write("Check the last successful Feodo Tracker update and whether its cached data may be stale.")
+    last_success = read_app_state("threat_feed_last_success_at")
+    last_attempt = read_app_state("threat_feed_last_attempt_at")
+    last_error = read_app_state("threat_feed_last_error")
+    count = read_app_state("threat_feed_indicator_count", "Unknown")
+    parsed = pd.to_datetime(last_success, utc=True, errors="coerce") if last_success else pd.NaT
+    age_hours = (datetime.now(timezone.utc) - parsed.to_pydatetime()).total_seconds() / 3600 if not pd.isna(parsed) else None
+    stale = age_hours is not None and age_hours > 24
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Feed status", "Stale" if stale else "Fresh" if age_hours is not None else "Not checked")
+    c2.metric("Last successful fetch (UTC)", str(last_success or "Never"))
+    c3.metric("Indicators in last feed", str(count))
+    st.write(f"Last attempt (UTC): {last_attempt or 'Never'}")
+    c1, c2 = st.columns(2)
+    c1.metric("VirusTotal API", "Configured" if setting("VT_API_KEY") else "Not configured")
+    c2.metric("AbuseIPDB API", "Configured" if setting("ABUSEIPDB_API_KEY") else "Not configured")
+    if last_error:
+        st.error(f"Most recent feed error: {last_error}")
+    if stale:
+        st.warning("The last successful Feodo Tracker data is more than 24 hours old. Refresh the Threat Feed and confirm network access.")
+        add_alert("Threat intelligence feed is stale", "Medium", f"Feodo Tracker last succeeded at {last_success}; current age is about {age_hours:.1f} hours. Verify source connectivity before relying on this feed.", source_event_id=f"feed-stale:{datetime.now(timezone.utc).date().isoformat()}")
+    elif age_hours is None:
+        st.info("Open Threat Feed and select Refresh threat feed to record the first successful fetch.")
+    else:
+        st.success(f"Feed data was last refreshed {age_hours:.1f} hours ago.")
+
+
 def render_audit_log():
     render_page_heading("Audit Log & Access")
     st.write("Review login attempts, alert and incident updates, IOC lookups, log scans, and report exports.")
@@ -3913,13 +4427,14 @@ def main():
                 st.markdown('<div class="cti-eyebrow">Secure access</div>', unsafe_allow_html=True)
                 st.subheader("Welcome back")
                 st.caption("Sign in with the account configured for this workspace.")
-                expected_username = setting("APP_USERNAME")
-                expected_password = setting("APP_PASSWORD")
-                if not expected_username or not expected_password:
+                accounts = configured_accounts()
+                if not accounts:
                     st.error("Authentication is not configured.")
                     st.code(
-                        'APP_USERNAME = "analyst"\n'
-                        'APP_PASSWORD = "choose-a-long-unique-password"'
+                        'APP_ADMIN_USERNAME = "admin"\n'
+                        'APP_ADMIN_PASSWORD = "choose-a-long-unique-password"\n'
+                        'APP_ANALYST_USERNAME = "analyst"\n'
+                        'APP_ANALYST_PASSWORD = "a-different-unique-password"'
                     )
                     st.caption(
                         "For local use, add these values to `.streamlit/secrets.toml`. "
@@ -3931,10 +4446,19 @@ def main():
                     password = st.text_input("Password", type="password")
                     submitted = st.form_submit_button("Sign in", type="primary", width="stretch")
                 if submitted:
-                    if hmac.compare_digest(username.strip(), expected_username) and hmac.compare_digest(password, expected_password):
+                    matched_account = next(
+                        (
+                            account for account in accounts
+                            if hmac.compare_digest(username.strip(), account[0])
+                            and hmac.compare_digest(password, account[1])
+                        ),
+                        None,
+                    )
+                    if matched_account:
                         st.session_state["authenticated"] = True
                         st.session_state["username"] = username.strip()
-                        audit_event("login_success", "Configured account authenticated.", username.strip())
+                        st.session_state["user_role"] = matched_account[2]
+                        audit_event("login_success", f"Configured {matched_account[2]} account authenticated.", username.strip())
                         st.rerun()
                     else:
                         audit_event("login_failure", f"Invalid sign-in attempt for username: {username.strip()[:80]}", username.strip() or "anonymous")
@@ -3942,6 +4466,8 @@ def main():
         st.stop()
 
     report = load_report()
+    if "user_role" not in st.session_state:
+        st.session_state["user_role"] = "Admin"
     st.sidebar.markdown(
         '<div class="cti-brand"><div class="cti-brand-mark">CTI</div>'
         '<div><div class="cti-brand-name">CYBER INTEL</div>'
@@ -3949,7 +4475,7 @@ def main():
         unsafe_allow_html=True,
     )
     st.sidebar.markdown(
-        '<div class="cti-session"><span class="cti-dot"></span> Analyst session active</div>',
+        f'<div class="cti-session"><span class="cti-dot"></span> {st.session_state["user_role"]} session active</div>',
         unsafe_allow_html=True,
     )
     if st.sidebar.button("Log out", width="stretch"):
@@ -3957,6 +4483,7 @@ def main():
         st.session_state["authenticated"] = False
         st.session_state["email_alerts_enabled_this_session"] = False
         st.session_state.pop("username", None)
+        st.session_state.pop("user_role", None)
         st.rerun()
 
     pages = [
@@ -3980,8 +4507,15 @@ def main():
         "Network Connection Map",
         "Daily Security Summary",
         "Configuration Backup",
+        "Asset Inventory",
+        "Alert Suppression",
+        "Scheduled Reports",
+        "Access & Roles",
+        "Threat Feed Health",
         "Audit Log & Access",
     ]
+    if not is_admin():
+        pages = [page for page in pages if page not in {"Alert Suppression", "Scheduled Reports", "Access & Roles", "Configuration Backup", "Detection Tuning", "IOC Watchlist"}]
     nav_symbols = {
         "Main Dashboard": "⌂",
         "Live Monitor": "◉",
@@ -4003,6 +4537,11 @@ def main():
         "Network Connection Map": "⇄",
         "Daily Security Summary": "▤",
         "Configuration Backup": "▣",
+        "Asset Inventory": "▦",
+        "Alert Suppression": "⊘",
+        "Scheduled Reports": "◷",
+        "Access & Roles": "♙",
+        "Threat Feed Health": "◌",
         "Audit Log & Access": "◷",
     }
     st.sidebar.markdown('<div class="cti-sidebar-label">Modules</div>', unsafe_allow_html=True)
@@ -4053,8 +4592,20 @@ def main():
         render_daily_security_summary()
     elif page == "Configuration Backup":
         render_config_backup_restore()
+    elif page == "Asset Inventory":
+        render_asset_inventory()
+    elif page == "Alert Suppression":
+        render_suppression_rules()
+    elif page == "Scheduled Reports":
+        render_scheduled_reports()
+    elif page == "Access & Roles":
+        render_access_roles()
+    elif page == "Threat Feed Health":
+        render_threat_feed_health()
     elif page == "Audit Log & Access":
         render_audit_log()
+    threat_feed_health_worker()
+    scheduled_report_worker()
 
 
 if __name__ == "__main__":
