@@ -14,19 +14,35 @@ import sqlite3
 import tomllib
 import socket
 import ssl
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
-from sklearn.ensemble import IsolationForest
-from sklearn.compose import ColumnTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestClassifier
+
+try:
+    from sklearn.ensemble import IsolationForest, RandomForestClassifier
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import (
+        accuracy_score,
+        balanced_accuracy_score,
+        classification_report,
+        confusion_matrix,
+        f1_score,
+    )
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder
+
+    SKLEARN_AVAILABLE = True
+    SKLEARN_IMPORT_ERROR = ""
+except Exception as error:
+    # Some managed Windows systems block compiled SciPy extensions. Keep the
+    # desktop dashboard usable and use the metadata-only fallback for live events.
+    SKLEARN_AVAILABLE = False
+    SKLEARN_IMPORT_ERROR = str(error)
 
 from ai_copilot import (
     AICopilotError,
@@ -617,7 +633,9 @@ def init_database():
                 details TEXT NOT NULL,
                 mitre_id TEXT,
                 source_event_id TEXT,
-                status TEXT NOT NULL DEFAULT 'Open'
+                status TEXT NOT NULL DEFAULT 'Open',
+                assigned_to TEXT NOT NULL DEFAULT '',
+                due_at TEXT
             )"""
         )
         alert_columns = {
@@ -625,6 +643,11 @@ def init_database():
         }
         if "source_event_id" not in alert_columns:
             connection.execute("ALTER TABLE alerts ADD COLUMN source_event_id TEXT")
+        if "assigned_to" not in alert_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN assigned_to TEXT NOT NULL DEFAULT ''")
+        if "due_at" not in alert_columns:
+            connection.execute("ALTER TABLE alerts ADD COLUMN due_at TEXT")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_alerts_due_at ON alerts(due_at)")
         connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_source_event_id "
             "ON alerts(source_event_id)"
@@ -684,6 +707,43 @@ def init_database():
                 severity TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'Open',
                 notes TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS ioc_watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                indicator_type TEXT NOT NULL,
+                indicator_value TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'Analyst supplied',
+                expires_at TEXT,
+                UNIQUE(indicator_type, indicator_value)
+            )"""
+        )
+        watchlist_columns = {row[1] for row in connection.execute("PRAGMA table_info(ioc_watchlist)")}
+        if "source" not in watchlist_columns:
+            connection.execute("ALTER TABLE ioc_watchlist ADD COLUMN source TEXT NOT NULL DEFAULT 'Analyst supplied'")
+        if "expires_at" not in watchlist_columns:
+            connection.execute("ALTER TABLE ioc_watchlist ADD COLUMN expires_at TEXT")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_ioc_watchlist_expiry ON ioc_watchlist(expires_at)")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS incident_alert_links (
+                incident_id INTEGER NOT NULL,
+                alert_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (incident_id, alert_id)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS incident_timeline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_id INTEGER NOT NULL,
+                occurred_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT ''
             )"""
         )
         connection.execute(
@@ -837,6 +897,189 @@ def load_incidents():
         return pd.read_sql_query(
             "SELECT * FROM incidents ORDER BY id DESC", connection
         )
+
+
+def record_incident_timeline(incident_id, event_type, note="", actor=None):
+    username = str(actor or st.session_state.get("username", "system"))[:120]
+    with connect_db() as connection:
+        connection.execute(
+            "INSERT INTO incident_timeline (incident_id, occurred_at, event_type, actor, note) VALUES (?, ?, ?, ?, ?)",
+            (int(incident_id), datetime.now(timezone.utc).isoformat(timespec="seconds"), str(event_type)[:80], username, str(note)[:4000]),
+        )
+
+
+def load_incident_timeline(incident_id):
+    with connect_db() as connection:
+        return pd.read_sql_query(
+            "SELECT occurred_at, event_type, actor, note FROM incident_timeline WHERE incident_id = ? ORDER BY occurred_at DESC, id DESC",
+            connection, params=(int(incident_id),),
+        )
+
+
+def get_detection_settings():
+    defaults = {"endpoint_alert_min_risk": 45, "ai_anomaly_min_score": 40}
+    with connect_db() as connection:
+        rows = connection.execute(
+            "SELECT key, value FROM app_state WHERE key IN ('endpoint_alert_min_risk', 'ai_anomaly_min_score')"
+        ).fetchall()
+    for key, value in rows:
+        try:
+            defaults[key] = max(0, min(100, int(value)))
+        except (TypeError, ValueError):
+            pass
+    return defaults
+
+
+def save_detection_settings(endpoint_alert_min_risk, ai_anomaly_min_score):
+    with connect_db() as connection:
+        connection.executemany(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [("endpoint_alert_min_risk", str(int(endpoint_alert_min_risk))), ("ai_anomaly_min_score", str(int(ai_anomaly_min_score)))],
+        )
+
+
+def load_ioc_watchlist(enabled_only=False):
+    query = "SELECT id, indicator_type, indicator_value, label, created_at, enabled, source, expires_at FROM ioc_watchlist"
+    if enabled_only:
+        query += " WHERE enabled = 1 AND (expires_at IS NULL OR expires_at = '' OR expires_at >= date('now'))"
+    query += " ORDER BY id DESC"
+    with connect_db() as connection:
+        return pd.read_sql_query(query, connection)
+
+
+def validate_watchlist_indicator(indicator_type, value):
+    clean = str(value).strip().lower()
+    kind = str(indicator_type).lower()
+    if kind == "ip address":
+        return str(ipaddress.ip_address(clean))
+    if kind == "file hash":
+        if not re.fullmatch(r"(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})", clean):
+            raise ValueError("Enter a valid MD5, SHA-1, SHA-256, or SHA-512 hexadecimal hash.")
+        return clean
+    if kind == "domain":
+        if len(clean) > 253 or not re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", clean):
+            raise ValueError("Enter a valid domain name, such as suspicious.example.")
+        return clean
+    raise ValueError("Choose an IP address, domain, or file hash.")
+
+
+def sync_watchlist_alerts(events):
+    if events is None or events.empty:
+        return 0
+    watchlist = load_ioc_watchlist(enabled_only=True)
+    if watchlist.empty:
+        return 0
+    created = 0
+    for event in events.to_dict("records"):
+        event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
+        if not event_id:
+            continue
+        fields = {
+            "ip address": [event.get("remote_ip", "")],
+            "domain": [],
+            "file hash": [event.get("file_sha256", "")],
+        }
+        text = " ".join(str(event.get(key) or "") for key in ("summary", "details", "file_name", "process_name"))
+        for row in watchlist.itertuples(index=False):
+            value = str(row.indicator_value).strip().lower()
+            kind = str(row.indicator_type).lower()
+            matched = False
+            if kind == "ip address":
+                matched = any(str(item or "").strip().lower() == value for item in fields[kind]) or bool(re.search(r"(?<![\w.])" + re.escape(value) + r"(?![\w.])", text, re.I))
+            elif kind == "file hash":
+                matched = any(str(item or "").strip().lower() == value for item in fields[kind]) or bool(re.search(r"(?<![a-f0-9])" + re.escape(value) + r"(?![a-f0-9])", text, re.I))
+            elif kind == "domain":
+                matched = bool(re.search(r"(?<![a-z0-9.-])" + re.escape(value) + r"(?![a-z0-9.-])", text, re.I))
+            if not matched:
+                continue
+            label = str(row.label or "").strip()
+            details = "\n".join([
+                "Indicator matched an analyst-maintained local watchlist.",
+                f"Type: {row.indicator_type}",
+                f"Indicator: {value}",
+                f"Label: {label or 'Not provided'}",
+                f"Event: {event.get('summary') or event.get('event_type') or 'Endpoint activity'}",
+                "A watchlist match is a review signal and requires verification.",
+            ])
+            severity = "High"
+            source_key = f"watchlist:{int(row.id)}:{event_id}"
+            if add_alert(f"Watchlist match: {label or value}", severity, details, source_event_id=source_key):
+                created += 1
+    return created
+
+
+def render_ioc_watchlist():
+    render_page_heading("IOC Watchlist")
+    st.write("Keep IP addresses, domains, and file hashes you want the sensor events checked against.")
+    st.caption("Matches create deduplicated alerts when endpoint metadata or an authorized local log contains the indicator. The sensor currently records IPs and file hashes; domain matches are available in text/log evidence where the domain is present.")
+    with st.form("ioc_watchlist_add_form", clear_on_submit=True):
+        kind = st.selectbox("Indicator type", ["IP address", "Domain", "File hash"])
+        value = st.text_input("Indicator value", max_chars=253)
+        label = st.text_input("Friendly label (optional)", max_chars=120)
+        source_name = st.selectbox("Indicator source", ["Analyst supplied", "Threat feed", "VirusTotal", "AbuseIPDB", "Other"])
+        has_expiry = st.checkbox("Set an expiry date", value=False)
+        expires_on = st.date_input("Expires after (UTC)", value=datetime.now(timezone.utc).date() + timedelta(days=30), disabled=not has_expiry)
+        submitted = st.form_submit_button("Add to watchlist")
+    if submitted:
+        try:
+            normalized = validate_watchlist_indicator(kind, value)
+            with connect_db() as connection:
+                connection.execute(
+                    "INSERT INTO ioc_watchlist (indicator_type, indicator_value, label, created_at, enabled, source, expires_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (kind.lower(), normalized, label.strip()[:120], datetime.now(timezone.utc).isoformat(timespec="seconds"), source_name, expires_on.isoformat() if has_expiry else None),
+                )
+            audit_event("ioc_watchlist_added", f"type={kind}; indicator={normalized}")
+            st.success("Indicator added to the watchlist.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+        except sqlite3.IntegrityError:
+            st.info("This indicator is already on the watchlist.")
+    items = load_ioc_watchlist()
+    st.subheader("Saved indicators")
+    if items.empty:
+        st.info("Watchlist is empty. Add an indicator above to start monitoring for matches.")
+        return
+    display = items.rename(columns={"indicator_type":"Type", "indicator_value":"Indicator", "label":"Label", "created_at":"Added (UTC)", "enabled":"Enabled", "source":"Source", "expires_at":"Expires (UTC)"})
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+    display["Status"] = display.apply(lambda row: "Expired" if row["Expires (UTC)"] and str(row["Expires (UTC)"]) < today_utc else "Active" if row["Enabled"] else "Disabled", axis=1)
+    st.dataframe(display[["id", "Type", "Indicator", "Label", "Source", "Added (UTC)", "Expires (UTC)", "Status"]], hide_index=True, width="stretch")
+    options = {f"#{row.id} · {row.indicator_type} · {row.indicator_value}": int(row.id) for row in items.itertuples(index=False)}
+    selected = st.selectbox("Indicator to update", list(options), key="watchlist_selected_item")
+    left, right = st.columns(2)
+    selected_id = options[selected]
+    current_enabled = bool(items.loc[items["id"] == selected_id, "enabled"].iloc[0])
+    with left:
+        if st.button("Disable indicator" if current_enabled else "Enable indicator", key="watchlist_toggle"):
+            with connect_db() as connection:
+                connection.execute("UPDATE ioc_watchlist SET enabled = ? WHERE id = ?", (0 if current_enabled else 1, selected_id))
+            audit_event("ioc_watchlist_toggled", f"id={selected_id}; enabled={not current_enabled}")
+            st.rerun()
+    with right:
+        if st.button("Remove indicator", key="watchlist_remove", type="secondary"):
+            with connect_db() as connection:
+                connection.execute("DELETE FROM ioc_watchlist WHERE id = ?", (selected_id,))
+            audit_event("ioc_watchlist_removed", f"id={selected_id}")
+            st.rerun()
+
+
+def render_detection_tuning():
+    render_page_heading("Detection Tuning")
+    st.write("Adjust when endpoint and AI signals are promoted into investigation alerts.")
+    st.caption("Lower values create more review alerts; higher values focus on stronger signals. These settings do not change the sensor's file/network collection behavior.")
+    values = get_detection_settings()
+    with st.form("detection_tuning_form"):
+        endpoint_threshold = st.slider("Minimum endpoint risk to create an alert", 0, 100, values["endpoint_alert_min_risk"], 5, help="Sensor event risk score required before a Review event is promoted. High and Critical sensor severities still create alerts.")
+        anomaly_threshold = st.slider("Minimum anomaly score for an AI alert", 20, 95, max(20, values["ai_anomaly_min_score"]), 5, help="Sets the cutoff for metadata fallback scoring and filters weaker AI anomaly alerts.")
+        saved = st.form_submit_button("Save detection settings")
+    if saved:
+        save_detection_settings(endpoint_threshold, anomaly_threshold)
+        audit_event("detection_settings_updated", f"endpoint_min_risk={endpoint_threshold}; ai_min_score={anomaly_threshold}")
+        st.success("Detection settings saved. New events will use these thresholds.")
+        st.rerun()
+    st.markdown("#### Current effect")
+    st.write(f"Endpoint review alerts: risk score {values['endpoint_alert_min_risk']} or higher. High/Critical sensor alerts are always kept.")
+    st.write(f"AI anomaly alert minimum: score {values['ai_anomaly_min_score']} or higher.")
 
 
 def notify_security_alert(severity, title):
@@ -1025,6 +1268,7 @@ def sync_endpoint_alerts(events):
         return 0
 
     severity_map = {"Review": "Medium", "High": "High", "Critical": "Critical"}
+    min_risk = get_detection_settings()["endpoint_alert_min_risk"]
 
     def value(event, key, default=""):
         result = event.get(key, default)
@@ -1040,6 +1284,12 @@ def sync_endpoint_alerts(events):
         for event in events.to_dict("records"):
             event_severity = value(event, "severity").title()
             if event_severity not in severity_map:
+                continue
+            try:
+                event_risk = int(float(value(event, "risk_score", "0")))
+            except (TypeError, ValueError):
+                event_risk = 0
+            if event_severity not in {"High", "Critical"} and event_risk < min_risk:
                 continue
 
             event_id = value(event, "event_id")
@@ -1106,7 +1356,7 @@ def sync_endpoint_alerts(events):
 
 def add_incident(title, severity, notes):
     with connect_db() as connection:
-        connection.execute(
+        cursor = connection.execute(
             """INSERT INTO incidents
                (created_at, title, severity, status, notes)
                VALUES (?, ?, ?, 'Open', ?)""",
@@ -1117,6 +1367,9 @@ def add_incident(title, severity, notes):
                 notes,
             ),
         )
+        incident_id = int(cursor.lastrowid)
+    record_incident_timeline(incident_id, "Incident created", f"{severity}: {title}\n{notes}")
+    return incident_id
 
 
 def load_report():
@@ -1351,8 +1604,59 @@ def sensor_health_report(events, source):
     }
 
 
+def sync_sensor_health_alert(report, source):
+    """Create one alert per sensor outage and resolve it after heartbeat recovery."""
+    mode = "cloud" if source == "cloud" else "local"
+    state_key = f"sensor_health_episode_{mode}"
+    is_down = str(report.get("status", "")).lower().startswith(("offline", "stopped"))
+    last_heartbeat = str(report.get("last_heartbeat", "Unknown"))
+    has_seen_sensor = last_heartbeat not in {"Never", "Unknown", ""}
+    with connect_db() as connection:
+        state_row = connection.execute("SELECT value FROM app_state WHERE key = ?", (state_key,)).fetchone()
+        episode = state_row[0] if state_row else ""
+    if is_down and has_seen_sensor and episode != "open":
+        details = (
+            f"Sensor source: {mode}; current status: {report.get('status')}; "
+            f"last heartbeat: {last_heartbeat}; last event: {report.get('last_event', 'Unknown')}; "
+            f"cloud sync: {report.get('cloud_sync', 'Unknown')}. "
+            "Check the sensor process, network connection, and pending upload queue."
+        )
+        episode_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        add_alert(
+            f"Endpoint sensor is offline ({mode})", "High", details,
+            source_event_id=f"sensor-health:{mode}:{episode_id}",
+        )
+        with connect_db() as connection:
+            connection.execute(
+                "INSERT INTO app_state (key, value) VALUES (?, 'open') ON CONFLICT(key) DO UPDATE SET value='open'",
+                (state_key,),
+            )
+        audit_event("sensor_health_outage_detected", f"source={mode}; last_heartbeat={last_heartbeat}")
+    elif not is_down and episode == "open":
+        prefix = f"sensor-health:{mode}:%"
+        with connect_db() as connection:
+            rows = connection.execute(
+                "SELECT id, status FROM alerts WHERE source_event_id LIKE ? AND status IN ('Open', 'Acknowledged')",
+                (prefix,),
+            ).fetchall()
+            connection.execute(
+                "INSERT INTO app_state (key, value) VALUES (?, 'recovered') ON CONFLICT(key) DO UPDATE SET value='recovered'",
+                (state_key,),
+            )
+            connection.executemany(
+                "UPDATE alerts SET status = 'Resolved' WHERE id = ?",
+                [(int(row[0]),) for row in rows],
+            )
+        for alert_id, _ in rows:
+            record_alert_timeline(int(alert_id), "Sensor recovered", f"{mode.title()} sensor heartbeat is healthy again; alert resolved.")
+        if rows:
+            audit_event("sensor_health_recovered", f"source={mode}; resolved_alerts={len(rows)}")
+
+
+@st.fragment(run_every="10s")
 def render_sensor_health_cards(events, source):
     report = sensor_health_report(events, source)
+    sync_sensor_health_alert(report, source)
     st.markdown("#### Sensor health and cloud sync")
     status_col, heartbeat_col, event_col, sync_col = st.columns(4)
     status_col.metric("Sensor", report["status"], help=report["explanation"])
@@ -1470,6 +1774,82 @@ def make_pdf(report):
             pdf.setFont("Helvetica", 7)
 
     pdf.save()
+    return buffer.getvalue()
+
+
+def make_incident_evidence_zip(incident, alerts, timeline):
+    """Package incident metadata, linked evidence records and their timelines."""
+    incident_id = int(incident.get("id"))
+    alert_ids = [int(value) for value in alerts.get("id", pd.Series(dtype=int)).dropna().tolist()] if alerts is not None and not alerts.empty else []
+    timeline_parts = []
+    if alert_ids:
+        with connect_db() as connection:
+            for alert_id in alert_ids:
+                rows = pd.read_sql_query(
+                    "SELECT alert_id, occurred_at, event_type, actor, note FROM alert_timeline WHERE alert_id = ? ORDER BY occurred_at, id",
+                    connection, params=(alert_id,),
+                )
+                if not rows.empty:
+                    timeline_parts.append(rows)
+    alert_timeline = pd.concat(timeline_parts, ignore_index=True) if timeline_parts else pd.DataFrame(columns=["alert_id", "occurred_at", "event_type", "actor", "note"])
+    ioc_matches = alerts[alerts.get("title", pd.Series(index=alerts.index, dtype=str)).astype(str).str.startswith("Watchlist match:")].copy() if alerts is not None and not alerts.empty else pd.DataFrame()
+    log_findings = alerts[alerts.get("title", pd.Series(index=alerts.index, dtype=str)).astype(str).str.startswith("Log finding:")].copy() if alerts is not None and not alerts.empty else pd.DataFrame()
+    manifest = (
+        "AI Cyber Threat Intelligence — Incident Evidence Bundle\n"
+        f"Incident ID: {incident_id}\n"
+        f"Generated (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
+        "Contents: incident.json, linked_alerts.csv, incident_timeline.csv, alert_timelines.csv, ioc_matches.csv, log_findings.csv.\n"
+        "Original uploaded log files are not retained by the application and are not included. Log finding alert records contain the saved reason and limited excerpt.\n"
+        "Indicators and automated correlations are investigation leads, not confirmed malware verdicts."
+    )
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("manifest.txt", manifest)
+        bundle.writestr("incident.json", json.dumps(incident.to_dict(), ensure_ascii=False, indent=2, default=str))
+        bundle.writestr("linked_alerts.csv", alerts.to_csv(index=False).encode("utf-8-sig") if alerts is not None and not alerts.empty else b"id,title,severity,status\n")
+        bundle.writestr("incident_timeline.csv", timeline.to_csv(index=False).encode("utf-8-sig") if timeline is not None and not timeline.empty else b"occurred_at,event_type,actor,note\n")
+        bundle.writestr("alert_timelines.csv", alert_timeline.to_csv(index=False).encode("utf-8-sig"))
+        bundle.writestr("ioc_matches.csv", ioc_matches.to_csv(index=False).encode("utf-8-sig"))
+        bundle.writestr("log_findings.csv", log_findings.to_csv(index=False).encode("utf-8-sig"))
+    return buffer.getvalue()
+
+
+def make_incident_pdf(incident, alerts, timeline):
+    from reportlab.lib import colors as pdf_colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+
+    buffer = BytesIO()
+    document = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=0.55*inch, leftMargin=0.55*inch, topMargin=0.55*inch, bottomMargin=0.55*inch)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="IncidentBody", parent=styles["BodyText"], fontSize=8, leading=11, wordWrap="CJK"))
+    styles.add(ParagraphStyle(name="IncidentTitle", parent=styles["Title"], fontSize=17, leading=21, textColor=pdf_colors.HexColor("#14213D")))
+    safe = lambda value: escape(str(value or "").encode("latin-1", "replace").decode("latin-1")).replace("\n", "<br/>")
+    story = [Paragraph("Incident Investigation Report", styles["IncidentTitle"]), Spacer(1, 10)]
+    summary = [["Incident ID", "Title", "Severity", "Status", "Created (UTC)"], [str(incident.get("id", "")), safe(incident.get("title", "")), safe(incident.get("severity", "")), safe(incident.get("status", "")), safe(incident.get("created_at", ""))]]
+    table = Table(summary, colWidths=[0.8*inch, 2.8*inch, 0.8*inch, 0.8*inch, 1.4*inch], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),pdf_colors.HexColor("#22577A")),("TEXTCOLOR",(0,0),(-1,0),pdf_colors.white),("GRID",(0,0),(-1,-1),0.4,pdf_colors.HexColor("#CCD6E0")),("FONTNAME",(0,0),(-1,-1),"Helvetica"),("FONTSIZE",(0,0),(-1,-1),7),("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),5)]))
+    story += [table, Spacer(1, 8), Paragraph("Incident notes", styles["Heading2"]), Paragraph(safe(incident.get("notes", "")) or "No notes recorded.", styles["IncidentBody"]), Spacer(1, 8), Paragraph("Linked alerts", styles["Heading2"])]
+    alert_rows = [["ID", "Time", "Severity", "Status", "Title"]]
+    for row in alerts.to_dict("records") if alerts is not None and not alerts.empty else []:
+        alert_rows.append([str(row.get("id", "")), safe(row.get("created_at", "")), safe(row.get("severity", "")), safe(row.get("status", "")), safe(row.get("title", ""))])
+    if len(alert_rows) == 1:
+        alert_rows.append(["-", "-", "-", "-", "No linked alerts"])
+    table = Table(alert_rows, colWidths=[0.4*inch, 1.3*inch, 0.7*inch, 0.8*inch, 3.4*inch], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),pdf_colors.HexColor("#22577A")),("TEXTCOLOR",(0,0),(-1,0),pdf_colors.white),("GRID",(0,0),(-1,-1),0.4,pdf_colors.HexColor("#CCD6E0")),("FONTNAME",(0,0),(-1,-1),"Helvetica"),("FONTSIZE",(0,0),(-1,-1),7),("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),4)]))
+    story += [table, Spacer(1, 8), Paragraph("Investigation timeline", styles["Heading2"])]
+    timeline_rows = [["Time (UTC)", "Activity", "User", "Details"]]
+    for row in timeline.to_dict("records") if timeline is not None and not timeline.empty else []:
+        timeline_rows.append([safe(row.get("occurred_at", "")), safe(row.get("event_type", "")), safe(row.get("actor", "")), safe(row.get("note", ""))])
+    if len(timeline_rows) == 1:
+        timeline_rows.append(["-", "-", "-", "No investigation timeline recorded"])
+    table = Table(timeline_rows, colWidths=[1.2*inch, 1.1*inch, 0.8*inch, 3.5*inch], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),pdf_colors.HexColor("#22577A")),("TEXTCOLOR",(0,0),(-1,0),pdf_colors.white),("GRID",(0,0),(-1,-1),0.4,pdf_colors.HexColor("#CCD6E0")),("FONTNAME",(0,0),(-1,-1),"Helvetica"),("FONTSIZE",(0,0),(-1,-1),7),("VALIGN",(0,0),(-1,-1),"TOP"),("PADDING",(0,0),(-1,-1),4)]))
+    story.append(table)
+    document.build(story)
     return buffer.getvalue()
 
 
@@ -2058,13 +2438,28 @@ def live_event_features(events):
 def analyze_live_events(events, model_minimum=20):
     events = events.copy()
     features = live_event_features(events)
+    anomaly_cutoff = get_detection_settings()["ai_anomaly_min_score"]
     if len(events) >= model_minimum:
-        model = IsolationForest(n_estimators=40, contamination="auto", random_state=42, n_jobs=1)
-        predictions = model.fit_predict(features)
-        decision = model.decision_function(features)
-        events["AI anomaly"] = predictions == -1
-        events["AI anomaly score"] = (pd.Series(-decision, index=events.index).rank(pct=True) * 100).round().astype(int)
-        model_label = "Isolation Forest · rolling endpoint baseline"
+        if SKLEARN_AVAILABLE:
+            model = IsolationForest(n_estimators=40, contamination="auto", random_state=42, n_jobs=1)
+            predictions = model.fit_predict(features)
+            decision = model.decision_function(features)
+            events["AI anomaly score"] = (pd.Series(-decision, index=events.index).rank(pct=True) * 100).round().astype(int)
+            events["AI anomaly"] = (predictions == -1) & events["AI anomaly score"].ge(anomaly_cutoff)
+            model_label = "Isolation Forest · rolling endpoint baseline"
+        else:
+            severity_points = features["severity_level"].map({0.0: 0, 1.0: 8, 2.0: 22, 3.0: 35}).fillna(0)
+            rare_process = features["process_frequency"].le(1) & features["process_frequency"].gt(0)
+            raw_score = (
+                features["sensor_risk"] * 0.25
+                + features["uncommon_remote_port"] * 30
+                + rare_process.astype(int) * 20
+                + features["ioc_match"] * 60
+                + severity_points
+            ).clip(0, 100)
+            events["AI anomaly score"] = raw_score.round().astype(int)
+            events["AI anomaly"] = raw_score.ge(anomaly_cutoff)
+            model_label = "Metadata anomaly rules · scientific-library fallback"
     else:
         events["AI anomaly"] = False
         events["AI anomaly score"] = 0
@@ -2105,7 +2500,10 @@ def analyze_live_events(events, model_minimum=20):
         if bool(process_rare.at[index]):
             signals.append("Process is rare in this event window")
         if bool(events.at[index, "AI anomaly"]):
-            signals.append("ML model marked this event as an outlier")
+            if SKLEARN_AVAILABLE:
+                signals.append("ML model marked this event as an outlier")
+            else:
+                signals.append("Metadata anomaly rules flagged this event")
         reasons.append("; ".join(signals) if signals else "No elevated signal in current metadata")
     events["AI indicators"] = reasons
     return events, model_label
@@ -2242,6 +2640,7 @@ def create_ai_anomaly_alerts(events):
     notifications = []
     audit_rows = []
     timeline_rows = []
+    settings = get_detection_settings()
     with connect_db() as connection:
         for event in events.to_dict("records"):
             event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
@@ -2249,6 +2648,8 @@ def create_ai_anomaly_alerts(events):
                 continue
             score = int(event.get("AI risk score", event.get("AI anomaly score", 0)) or 0)
             sensor_severity = str(event.get("severity") or "").title()
+            if score < settings["endpoint_alert_min_risk"] or int(event.get("AI anomaly score", 0) or 0) < settings["ai_anomaly_min_score"]:
+                continue
             severity = str(event.get("AI severity") or ("Critical" if sensor_severity == "Critical" else "High" if score >= 70 or sensor_severity == "High" else "Medium"))
             summary = str(event.get("summary") or event.get("event_type") or "Endpoint anomaly")
             details = "\n".join([
@@ -2412,6 +2813,12 @@ def evaluate_dataset(train_frame, test_frame, target, row_limit):
 def render_model_evaluation_lab():
     render_page_heading("AI Model Evaluation Lab")
     st.write("Train and evaluate a Random Forest on a labeled dataset using held-out test data.")
+    if not SKLEARN_AVAILABLE:
+        st.warning(
+            "Model evaluation is unavailable because this computer blocked a scientific-library component. "
+            "The live dashboard and metadata-based anomaly scoring are still available."
+        )
+        return
     st.caption("Evaluation runs only when you press Run evaluation. Uploaded dataset contents are processed in app memory and are not saved or sent to a threat-intelligence provider.")
     train_path = BASE_DIR / "Data" / "UNSW_NB15_training-set.csv"
     test_path = BASE_DIR / "Data" / "UNSW_NB15_testing-set.csv"
@@ -2679,6 +3086,7 @@ def render_alert_system():
     try:
         endpoint_events, _ = load_sensor_events(limit=1000)
         new_alerts = sync_endpoint_alerts(endpoint_events)
+        new_alerts += sync_watchlist_alerts(endpoint_events)
         if len(endpoint_events) >= 20:
             analyzed_events, _ = analyze_live_events(endpoint_events)
             ai_anomalies = analyzed_events[analyzed_events["AI anomaly"]]
@@ -2689,6 +3097,12 @@ def render_alert_system():
         st.warning(f"Could not check live endpoint events: {error}")
 
     alerts = hide_cleared_notifications(load_alerts())
+    if not alerts.empty and {"due_at", "status"}.issubset(alerts.columns):
+        due_values = pd.to_datetime(alerts["due_at"], utc=True, errors="coerce")
+        overdue = due_values.lt(pd.Timestamp.now(tz="UTC")) & alerts["status"].isin(["Open", "Acknowledged"])
+        alerts["SLA status"] = "No deadline"
+        alerts.loc[due_values.notna(), "SLA status"] = "On time"
+        alerts.loc[overdue, "SLA status"] = "OVERDUE"
     cleared_message = st.session_state.pop("notifications_cleared_message", None)
     if cleared_message:
         st.success(cleared_message)
@@ -2733,6 +3147,22 @@ def render_alert_system():
         st.rerun()
 
     selected_alert = visible.loc[visible["id"].astype(int) == int(selected_id)].iloc[0]
+    if str(selected_alert.get("SLA status", "")) == "OVERDUE":
+        st.error("This alert has passed its review deadline.")
+    with st.form(f"alert_assignment_sla_form_{selected_id}"):
+        assigned_to = st.text_input("Assigned analyst", value=str(selected_alert.get("assigned_to") or ""), max_chars=120, key=f"alert_assignee_{selected_id}")
+        has_deadline = st.checkbox("Set review deadline", value=bool(selected_alert.get("due_at")), key=f"alert_deadline_enabled_{selected_id}")
+        deadline_hours = st.number_input("Deadline in hours from now", min_value=1, max_value=720, value=24, step=1, key=f"alert_deadline_hours_{selected_id}", disabled=not has_deadline)
+        assignment_saved = st.form_submit_button("Save assignment and SLA")
+    if assignment_saved:
+        due_at = (datetime.now(timezone.utc) + timedelta(hours=int(deadline_hours))).isoformat(timespec="seconds") if has_deadline else None
+        with connect_db() as connection:
+            connection.execute("UPDATE alerts SET assigned_to = ?, due_at = ? WHERE id = ?", (assigned_to.strip(), due_at, int(selected_id)))
+        record_alert_timeline(int(selected_id), "Assignment/SLA updated", f"Assigned to: {assigned_to.strip() or 'Unassigned'}; deadline: {due_at or 'None'}")
+        audit_event("alert_assignment_sla_updated", f"alert_id={selected_id}; assigned={assigned_to.strip()[:100]}; deadline={due_at or 'none'}")
+        st.success("Assignment and review deadline saved.")
+        st.rerun()
+
     with st.expander("Alert evidence and context"):
         st.caption(f"Created: {selected_alert.get('created_at', 'Unknown')}")
         st.caption(f"MITRE ATT&CK: {selected_alert.get('mitre_id') or 'Not mapped'}")
@@ -2810,9 +3240,18 @@ def render_incident_management():
                 ranks = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
                 severity = max((row.severity for row in selected_rows), key=lambda item: ranks.get(item, 0))
                 notes = "Related alert IDs: " + ", ".join(str(row.id) for row in selected_rows) + "\n\n" + "\n".join(f"[{row.severity}] {row.title}" for row in selected_rows)
-                add_incident(f"Grouped investigation ({len(selected_rows)} alerts)", severity, notes)
-                audit_event("incident_created_from_alerts", f"alert_ids={','.join(str(row.id) for row in selected_rows)}")
-                st.success("Incident created with the selected alerts linked in its notes.")
+                incident_id = add_incident(f"Grouped investigation ({len(selected_rows)} alerts)", severity, notes)
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                with connect_db() as connection:
+                    connection.executemany(
+                        "INSERT OR IGNORE INTO incident_alert_links (incident_id, alert_id, created_at) VALUES (?, ?, ?)",
+                        [(incident_id, int(row.id), now) for row in selected_rows],
+                    )
+                for row in selected_rows:
+                    record_incident_timeline(incident_id, "Alert linked", f"Alert #{row.id}: {row.title}")
+                    record_alert_timeline(int(row.id), "Linked to incident", f"Incident #{incident_id}")
+                audit_event("incident_created_from_alerts", f"incident_id={incident_id}; alert_ids={','.join(str(row.id) for row in selected_rows)}")
+                st.success("Incident created with alert links and investigation timeline.")
                 st.rerun()
     with st.form("new_incident_form"):
         title = st.text_input("Incident title")
@@ -2848,29 +3287,99 @@ def render_incident_management():
                 "UPDATE incidents SET status = ? WHERE id = ?",
                 (status, int(selected_id)),
             )
+        record_incident_timeline(int(selected_id), "Status changed", f"Incident status set to {status}")
         audit_event("incident_status_changed", f"incident_id={selected_id}; status={status}")
-        st.success("Incident status updated.")
+        st.success("Incident status updated and timeline saved.")
         st.rerun()
 
+    selected_incident = incidents.loc[incidents["id"].astype(int) == int(selected_id)].iloc[0]
+    with connect_db() as connection:
+        linked_ids = [int(row[0]) for row in connection.execute(
+            "SELECT alert_id FROM incident_alert_links WHERE incident_id = ? ORDER BY alert_id", (int(selected_id),)
+        ).fetchall()]
+        if not linked_ids:
+            legacy = re.search(r"Related alert IDs:\s*([0-9, ]+)", str(selected_incident.get("notes", "")))
+            if legacy:
+                linked_ids = [int(value) for value in re.findall(r"\d+", legacy.group(1))]
+        timeline = load_incident_timeline(int(selected_id))
+        if linked_ids:
+            marks = ",".join("?" for _ in linked_ids)
+            linked_alerts = pd.read_sql_query(f"SELECT * FROM alerts WHERE id IN ({marks}) ORDER BY id", connection, params=linked_ids)
+        else:
+            linked_alerts = pd.DataFrame()
+    st.markdown("#### Linked alerts")
+    if linked_alerts.empty:
+        st.info("No linked alerts. Group alerts in the section above to include them in the incident export.")
+    else:
+        st.dataframe(linked_alerts, hide_index=True, width="stretch")
+    st.markdown("#### Incident investigation timeline")
+    if timeline.empty:
+        st.caption("No incident timeline activity has been recorded yet.")
+    else:
+        st.dataframe(timeline.rename(columns={"occurred_at":"Time (UTC)","event_type":"Activity","actor":"User","note":"Details"}), hide_index=True, width="stretch")
+    csv_parts = []
+    summary_row = selected_incident.to_frame().T
+    summary_row.insert(0, "record_type", "incident")
+    csv_parts.append(summary_row)
+    if not linked_alerts.empty:
+        linked_export = linked_alerts.copy()
+        linked_export.insert(0, "record_type", "linked_alert")
+        csv_parts.append(linked_export)
+    if not timeline.empty:
+        timeline_export = timeline.copy()
+        timeline_export.insert(0, "record_type", "incident_timeline")
+        csv_parts.append(timeline_export)
+    export_frame = pd.concat(csv_parts, ignore_index=True, sort=False)
+    stem = f"incident_{int(selected_id)}_report"
+    csv_bytes = export_frame.to_csv(index=False).encode("utf-8-sig")
+    pdf_bytes = make_incident_pdf(selected_incident, linked_alerts, timeline)
+    left, right = st.columns(2)
+    with left:
+        if st.download_button("Download incident report (CSV)", csv_bytes, f"{stem}.csv", "text/csv", key=f"incident_csv_{selected_id}"):
+            audit_event("incident_report_exported", f"incident_id={selected_id}; format=csv")
+    with right:
+        if st.download_button("Download incident report (PDF)", pdf_bytes, f"{stem}.pdf", "application/pdf", key=f"incident_pdf_{selected_id}"):
+            audit_event("incident_report_exported", f"incident_id={selected_id}; format=pdf")
+    evidence_zip = make_incident_evidence_zip(selected_incident, linked_alerts, timeline)
+    if st.download_button("Download incident evidence bundle (ZIP)", evidence_zip, f"incident_{int(selected_id)}_evidence.zip", "application/zip", key=f"incident_bundle_{selected_id}"):
+        audit_event("incident_evidence_bundle_exported", f"incident_id={selected_id}; linked_alerts={len(linked_alerts)}")
 
-def analyze_log_text(contents):
-    """Extract security-relevant log lines locally without storing the source log."""
+
+def analyze_log_text(contents, watchlist=None):
+    """Extract security-relevant log lines and optional watchlist matches locally."""
     ip_pattern = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
     failed_pattern = re.compile(r"failed password|failed login|authentication failure|invalid user|logon failure|event\s*id\s*[:=]?\s*4625", re.I)
     suspicious_pattern = re.compile(r"encodedcommand|(?:^|\s)-enc(?:odedcommand)?\b|downloadstring|invoke-webrequest|frombase64string|mimikatz|lsass|credential dump", re.I)
     malware_pattern = re.compile(r"malware|trojan|ransomware|quarantin|virus detected", re.I)
     detections = []
     failed_counts = {}
+    active_watchlist = watchlist if watchlist is not None else pd.DataFrame()
     for line_number, line in enumerate(contents.splitlines(), start=1):
         failed = bool(failed_pattern.search(line))
         suspicious_match = suspicious_pattern.search(line)
+        watchlist_matches = []
+        if not active_watchlist.empty:
+            for indicator in active_watchlist.itertuples(index=False):
+                token = str(indicator.indicator_value).strip()
+                kind = str(indicator.indicator_type).lower()
+                if kind == "ip address":
+                    found = bool(re.search(r"(?<![\w.])" + re.escape(token) + r"(?![\w.])", line, re.I))
+                elif kind == "file hash":
+                    found = bool(re.search(r"(?<![a-f0-9])" + re.escape(token) + r"(?![a-f0-9])", line, re.I))
+                else:
+                    found = bool(re.search(r"(?<![a-z0-9.-])" + re.escape(token) + r"(?![a-z0-9.-])", line, re.I))
+                if found:
+                    watchlist_matches.append((kind, token, str(indicator.label or "").strip()))
         if failed:
             ips = ip_pattern.findall(line)
             key = ips[0] if ips else "unknown source"
             failed_counts[key] = failed_counts.get(key, 0) + 1
-        if failed or suspicious_match or malware_pattern.search(line):
+        if failed or suspicious_match or malware_pattern.search(line) or watchlist_matches:
             reasons = []
             severity = "Medium"
+            for kind, token, label in watchlist_matches:
+                reasons.append(f"IOC watchlist match ({kind}): {token}" + (f" · {label}" if label else ""))
+                severity = "High"
             if failed:
                 reasons.append("Failed authentication pattern")
             if suspicious_match:
@@ -2909,7 +3418,7 @@ def render_log_analyzer():
         st.error("The selected log exceeds the 5 MB limit.")
         return
     text = content.decode("utf-8", errors="replace")
-    findings = analyze_log_text(text)
+    findings = analyze_log_text(text, load_ioc_watchlist(enabled_only=True))
     content_id = hashlib.sha256(content).hexdigest()
     if st.session_state.get("last_audited_log_hash") != content_id:
         audit_event("log_analyzed", f"filename={Path(upload.name).name}; bytes={len(content)}; findings={len(findings)}")
@@ -2954,6 +3463,334 @@ def render_log_analyzer():
             notify_security_alert(severity, title)
         audit_event("log_findings_promoted", f"filename={Path(upload.name).name}; findings={len(findings)}; new_alerts={inserted}")
         st.success(f"Created {inserted} new alert(s); repeated imports were deduplicated.")
+
+
+@st.fragment(run_every="10s")
+def render_threat_hunting():
+    render_page_heading("Threat Hunting")
+    st.write("Search recent endpoint events and group related activity by process for analyst review.")
+    try:
+        events, source = load_sensor_events(limit=5000)
+    except Exception as error:
+        st.error(f"Could not load endpoint events: {error}")
+        return
+    if events.empty:
+        st.info("No endpoint events are available yet. Start the local sensor and check its sync status.")
+        return
+    st.caption(f"Source: {source} · {len(events)} recent event(s) · auto-refresh every 10 seconds")
+    if st.button("Refresh now", key="threat_hunt_refresh"):
+        load_sensor_events.clear()
+        st.rerun()
+
+    data = events.copy()
+    if "risk_score" not in data:
+        data["risk_score"] = 0
+    data["risk_score"] = pd.to_numeric(data["risk_score"], errors="coerce").fillna(0).clip(0, 100)
+    time_column = next((column for column in ("occurred_at", "created_at") if column in data.columns), None)
+    lookback_hours = st.select_slider("Look back", options=[1, 6, 12, 24, 48, 72, 168], value=24, format_func=lambda value: f"{value} hour(s)")
+    if time_column:
+        parsed = pd.to_datetime(data[time_column], errors="coerce", utc=True)
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=lookback_hours)
+        data = data[parsed.isna() | parsed.ge(cutoff)].copy()
+        data["_parsed_time"] = parsed.loc[data.index]
+    columns = st.columns(3)
+    types = sorted(data.get("event_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    severities = sorted(data.get("severity", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    with columns[0]:
+        chosen_types = st.multiselect("Event type", types, default=types, key="hunt_types")
+    with columns[1]:
+        chosen_severity = st.multiselect("Sensor severity", severities, default=severities, key="hunt_severity")
+    with columns[2]:
+        min_risk = st.slider("Minimum risk score", 0, 100, 0, 5, key="hunt_min_risk")
+    query = st.text_input("Search event text, process, IP, or file name", key="hunt_query").strip().casefold()
+    if "event_type" in data:
+        data = data[data["event_type"].astype(str).isin(chosen_types)]
+    if "severity" in data:
+        data = data[data["severity"].astype(str).isin(chosen_severity)]
+    data = data[data["risk_score"].ge(min_risk)]
+    if query:
+        search_columns = [column for column in ("summary", "details", "process_name", "remote_ip", "file_name", "file_sha256") if column in data]
+        combined = data[search_columns].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
+        data = data[combined.str.contains(re.escape(query), regex=True, na=False)]
+    high_count = int(data.get("severity", pd.Series(index=data.index, dtype=str)).astype(str).str.lower().isin(["high", "critical"]).sum())
+    left, middle, right = st.columns(3)
+    left.metric("Matching events", len(data))
+    middle.metric("High / Critical", high_count)
+    right.metric("Median risk", round(float(data["risk_score"].median()), 1) if not data.empty else 0)
+    if data.empty:
+        st.info("No events match these filters.")
+        return
+    st.dataframe(data.drop(columns=["_parsed_time"], errors="ignore").head(1000), hide_index=True, width="stretch")
+    st.download_button("Download hunt results (CSV)", data.drop(columns=["_parsed_time"], errors="ignore").to_csv(index=False).encode("utf-8-sig"), "threat_hunt_events.csv", "text/csv", key="hunt_download")
+
+    process_col = "process_name" if "process_name" in data else None
+    if not process_col:
+        st.info("Process names are not present in this event set, so process correlation is unavailable.")
+        return
+    st.markdown("#### Related activity by process")
+    correlated = data[data[process_col].notna() & data[process_col].astype(str).str.strip().ne("")].copy()
+    if correlated.empty:
+        st.info("No process names are available in the filtered events.")
+        return
+    correlated["_event_type"] = correlated.get("event_type", pd.Series("unknown", index=correlated.index)).fillna("unknown").astype(str)
+    groups = correlated.groupby(process_col, dropna=True).agg(
+        event_count=(process_col, "size"),
+        distinct_event_types=("_event_type", "nunique"),
+        max_risk=("risk_score", "max"),
+        event_types=("_event_type", lambda values: ", ".join(sorted(set(values))[:8])),
+    ).reset_index()
+    groups = groups[(groups["event_count"] >= 3) | ((groups["event_count"] >= 2) & (groups["distinct_event_types"] >= 2)) | groups["max_risk"].ge(70)]
+    groups = groups.sort_values(["max_risk", "event_count"], ascending=False)
+    if groups.empty:
+        st.info("No process group met the correlation threshold in this time window.")
+        return
+    st.dataframe(groups, hide_index=True, width="stretch")
+    process_names = groups[process_col].astype(str).tolist()
+    chosen_process = st.selectbox("Process group to promote for investigation", process_names, key="hunt_correlated_process")
+    if st.button("Create deduplicated correlation alert", key="hunt_create_correlation_alert"):
+        related = correlated[correlated[process_col].astype(str).eq(chosen_process)].sort_values("_parsed_time" if "_parsed_time" in correlated else process_col, ascending=False).head(50)
+        row = groups[groups[process_col].astype(str).eq(chosen_process)].iloc[0]
+        digest = hashlib.sha256((chosen_process + "|" + "|".join(sorted(str(item) for item in related.get("event_id", related.get("event_uid", related.get("id", pd.Series(dtype=str))).tolist())))).encode("utf-8")).hexdigest()[:24]
+        addresses = sorted(set(related.get("remote_ip", pd.Series(dtype=str)).dropna().astype(str)))
+        details = "\n".join([
+            "Source: analyst-triggered process event correlation",
+            f"Process: {chosen_process}",
+            f"Related event count: {int(row['event_count'])}",
+            f"Event types: {row['event_types']}",
+            f"Highest sensor risk: {int(row['max_risk'])}/100",
+            f"Observed remote IPs: {', '.join(addresses[:20]) or 'None recorded'}",
+            "This correlation is a review lead, not a confirmed compromise.",
+        ])
+        created = add_alert(f"Correlated process activity: {chosen_process}", "High" if int(row["max_risk"]) < 90 else "Critical", details, source_event_id=f"threat-hunt:{digest}")
+        audit_event("threat_hunt_correlation_alert", f"process={chosen_process[:120]}; events={int(row['event_count'])}; created={created}")
+        st.success("Correlation alert created." if created else "This exact correlation was already promoted; duplicate alert was skipped.")
+
+
+def render_network_connection_map():
+    render_page_heading("Network Connection Map")
+    st.write("View which processes contacted which public IP addresses, along with observed ports and risk signals.")
+    st.caption("This is a process-to-IP relationship view built from sensor metadata. It does not geolocate devices or send IPs to a map provider.")
+    try:
+        events, source = load_sensor_events(limit=5000)
+    except Exception as error:
+        st.error(f"Could not load network events: {error}")
+        return
+    if events.empty or "remote_ip" not in events:
+        st.info("No network connection records are available yet.")
+        return
+    if "event_type" in events:
+        network = events[events["event_type"].astype(str).eq("network_connection")].copy()
+    else:
+        network = events.copy()
+    network = network[network["remote_ip"].notna()].copy()
+    if network.empty:
+        st.info("No outbound connection events were found in the current event window.")
+        return
+    def is_public(value):
+        try:
+            return ipaddress.ip_address(str(value).strip()).is_global
+        except ValueError:
+            return False
+    network = network[network["remote_ip"].map(is_public)]
+    if network.empty:
+        st.info("No public destination IPs are present in the available records.")
+        return
+    if "process_name" not in network:
+        network["process_name"] = "Unknown process"
+    network["process_name"] = network["process_name"].fillna("Unknown process").astype(str)
+    if "remote_port" not in network:
+        network["remote_port"] = ""
+    if "risk_score" not in network:
+        network["risk_score"] = 0
+    network["risk_score"] = pd.to_numeric(network["risk_score"], errors="coerce").fillna(0).clip(0,100)
+    groups = network.groupby(["process_name", "remote_ip", "remote_port"], dropna=False).agg(
+        observations=("remote_ip", "size"), max_risk=("risk_score", "max"),
+    ).reset_index().sort_values(["max_risk", "observations"], ascending=False)
+    st.caption(f"Source: {source} · {len(network)} connection observations · {network['remote_ip'].nunique()} public destination(s)")
+    st.dataframe(groups.head(500), hide_index=True, width="stretch")
+    edges = groups.head(80)
+    dot = ["digraph Connections {", "rankdir=LR;", 'graph [bgcolor="transparent", pad="0.25"];', 'node [style="filled", fontname="Arial", fontsize="10"];', 'edge [fontname="Arial", fontsize="8", color="#58718a"];']
+    process_nodes, ip_nodes = set(), set()
+    for row in edges.itertuples(index=False):
+        process = str(row.process_name)
+        remote = str(row.remote_ip)
+        process_id = "proc_" + hashlib.sha1(process.encode("utf-8", errors="replace")).hexdigest()[:12]
+        ip_id = "ip_" + hashlib.sha1(remote.encode("utf-8", errors="replace")).hexdigest()[:12]
+        if process_id not in process_nodes:
+            label = json.dumps(process.replace("\n", " ")[:70], ensure_ascii=False)
+            dot.append(f'{process_id} [label={label}, shape=box, fillcolor="#e9f2ff"];')
+            process_nodes.add(process_id)
+        if ip_id not in ip_nodes:
+            dot.append(f'{ip_id} [label="{remote}", shape=ellipse, fillcolor="#e3f6ef"];')
+            ip_nodes.add(ip_id)
+        port = str(row.remote_port or "")
+        risk = int(row.max_risk)
+        label = json.dumps(f"port {port or '?'} · risk {risk}", ensure_ascii=False)
+        dot.append(f'{process_id} -> {ip_id} [label={label}];')
+    dot.append("}")
+    st.graphviz_chart("\n".join(dot), width="stretch")
+    csv = groups.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("Download connection map data (CSV)", csv, "network_connection_map.csv", "text/csv", key="network_map_csv")
+
+
+def build_daily_summary(report_date):
+    try:
+        events, source = load_sensor_events(limit=10000)
+    except Exception as error:
+        events, source = pd.DataFrame(), f"unavailable ({type(error).__name__})"
+    alerts = load_alerts()
+    if not events.empty:
+        time_col = next((col for col in ("occurred_at", "created_at") if col in events), None)
+        if time_col:
+            event_times = pd.to_datetime(events[time_col], errors="coerce", utc=True)
+            events = events[event_times.dt.date.eq(report_date)].copy()
+    if not alerts.empty and "created_at" in alerts:
+        alert_times = pd.to_datetime(alerts["created_at"], errors="coerce", utc=True)
+        todays_alerts = alerts[alert_times.dt.date.eq(report_date)].copy()
+    else:
+        todays_alerts = pd.DataFrame()
+    if events.empty:
+        high_risk_events = 0
+        destination_count = 0
+        event_type_counts = pd.Series(dtype=int)
+        top_destinations = []
+    else:
+        risk = pd.to_numeric(events.get("risk_score", pd.Series(0, index=events.index)), errors="coerce").fillna(0)
+        severity = events.get("severity", pd.Series("", index=events.index)).fillna("").astype(str).str.lower()
+        high_risk_events = int((risk.ge(70) | severity.isin(["high", "critical"])).sum())
+        destination_count = int(events.get("remote_ip", pd.Series(dtype=str)).dropna().nunique())
+        event_type_counts = events.get("event_type", pd.Series("Unknown", index=events.index)).fillna("Unknown").astype(str).value_counts()
+        top_destinations = events.get("remote_ip", pd.Series(dtype=str)).dropna().astype(str).value_counts().head(5).to_dict()
+    open_alerts = int(alerts.get("status", pd.Series(dtype=str)).isin(["Open", "Acknowledged"]).sum()) if not alerts.empty else 0
+    open_incidents_df = load_incidents()
+    open_incidents = int(open_incidents_df.get("status", pd.Series(dtype=str)).isin(["Open", "Investigating", "Contained"]).sum()) if not open_incidents_df.empty else 0
+    watchlist_alerts = int(todays_alerts.get("title", pd.Series(dtype=str)).astype(str).str.startswith("Watchlist match:").sum()) if not todays_alerts.empty else 0
+    records = [
+        {"Metric": "Report date (UTC)", "Value": report_date.isoformat()},
+        {"Metric": "Event source", "Value": source},
+        {"Metric": "Endpoint events", "Value": len(events)},
+        {"Metric": "High-risk events (risk ≥ 70 or High/Critical)", "Value": high_risk_events},
+        {"Metric": "Distinct public destination IPs", "Value": destination_count},
+        {"Metric": "New alerts today", "Value": len(todays_alerts)},
+        {"Metric": "Watchlist match alerts today", "Value": watchlist_alerts},
+        {"Metric": "Currently open/acknowledged alerts", "Value": open_alerts},
+        {"Metric": "Open/investigating incidents", "Value": open_incidents},
+        {"Metric": "Top destination IPs", "Value": json.dumps(top_destinations, ensure_ascii=False)},
+        {"Metric": "Event type counts", "Value": json.dumps(event_type_counts.to_dict(), ensure_ascii=False)},
+    ]
+    return pd.DataFrame(records), events, todays_alerts
+
+
+def render_daily_security_summary():
+    render_page_heading("Daily Security Summary")
+    st.write("Create a UTC daily snapshot of endpoint events, alerts, destinations, and open incidents.")
+    report_date = st.date_input("Summary date (UTC)", value=datetime.now(timezone.utc).date(), key="daily_summary_date")
+    summary, events, alerts = build_daily_summary(report_date)
+    st.dataframe(summary, hide_index=True, width="stretch")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Events", len(events))
+    c2.metric("New alerts", len(alerts))
+    incidents = load_incidents()
+    c3.metric("Open incidents", int(incidents.get("status", pd.Series(dtype=str)).isin(["Open", "Investigating", "Contained"]).sum()) if not incidents.empty else 0)
+    left, right = st.columns(2)
+    with left:
+        if st.download_button("Download daily summary (CSV)", summary.to_csv(index=False).encode("utf-8-sig"), f"security_summary_{report_date.isoformat()}.csv", "text/csv"):
+            audit_event("daily_security_summary_exported", f"date={report_date}; format=csv")
+    with right:
+        if st.download_button("Download daily summary (PDF)", make_pdf(summary), f"security_summary_{report_date.isoformat()}.pdf", "application/pdf"):
+            audit_event("daily_security_summary_exported", f"date={report_date}; format=pdf")
+    if not alerts.empty:
+        st.markdown("#### Alerts created that day")
+        st.dataframe(alerts, hide_index=True, width="stretch")
+
+
+def make_config_backup():
+    watchlist = load_ioc_watchlist(enabled_only=False)
+    rows = watchlist.astype(object).where(pd.notna(watchlist), None).to_dict("records")
+    return {
+        "format": "ai-cyber-threat-intelligence-config",
+        "version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "detection_settings": get_detection_settings(),
+        "ioc_watchlist": [
+            {"indicator_type": row["indicator_type"], "indicator_value": row["indicator_value"], "label": row["label"], "enabled": bool(row["enabled"]), "source": row.get("source") or "Analyst supplied", "expires_at": row.get("expires_at")}
+            for row in rows
+        ],
+        "secrets_included": False,
+    }
+
+
+def restore_config_backup(payload, replace_existing=False):
+    if not isinstance(payload, dict) or payload.get("format") != "ai-cyber-threat-intelligence-config" or payload.get("version") != 1:
+        raise ValueError("This is not a supported CTI configuration backup.")
+    items = payload.get("ioc_watchlist")
+    if not isinstance(items, list) or len(items) > 5000:
+        raise ValueError("The backup watchlist must be a list of at most 5,000 indicators.")
+    settings = payload.get("detection_settings", {})
+    if not isinstance(settings, dict):
+        raise ValueError("Detection settings in this backup are invalid.")
+    endpoint_risk = max(0, min(100, int(settings.get("endpoint_alert_min_risk", 45))))
+    anomaly_score = max(20, min(95, int(settings.get("ai_anomaly_min_score", 40))))
+    cleaned = []
+    allowed_types = {"ip address", "domain", "file hash"}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("A watchlist backup entry is malformed.")
+        kind = str(item.get("indicator_type", "")).lower()
+        if kind not in allowed_types:
+            raise ValueError("A watchlist backup entry has an unsupported type.")
+        value = validate_watchlist_indicator(kind, item.get("indicator_value", ""))
+        expiry = item.get("expires_at")
+        if expiry:
+            try:
+                expiry = datetime.fromisoformat(str(expiry)).date().isoformat()
+            except ValueError as error:
+                raise ValueError("A watchlist expiry date in the backup is invalid.") from error
+        cleaned.append((kind, value, str(item.get("label") or "")[:120], int(bool(item.get("enabled", True))), str(item.get("source") or "Backup import")[:80], expiry))
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect_db() as connection:
+        if replace_existing:
+            connection.execute("DELETE FROM ioc_watchlist")
+        connection.executemany(
+            "INSERT INTO ioc_watchlist (indicator_type, indicator_value, label, created_at, enabled, source, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(indicator_type, indicator_value) DO UPDATE SET label=excluded.label, enabled=excluded.enabled, source=excluded.source, expires_at=excluded.expires_at",
+            [(kind, value, label, now, enabled, source, expiry) for kind, value, label, enabled, source, expiry in cleaned],
+        )
+    save_detection_settings(endpoint_risk, anomaly_score)
+    return len(cleaned), endpoint_risk, anomaly_score
+
+
+def render_config_backup_restore():
+    render_page_heading("Configuration Backup")
+    st.write("Export or restore your IOC watchlist and detection thresholds.")
+    st.warning("Backup contains indicator values and labels, but never includes passwords, SMTP credentials, API tokens, or API keys. Keep the downloaded file private.")
+    payload = make_config_backup()
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    if st.download_button("Download configuration backup (JSON)", data, "cti_configuration_backup.json", "application/json"):
+        audit_event("configuration_backup_exported", f"watchlist_entries={len(payload['ioc_watchlist'])}")
+    st.markdown("#### Restore a backup")
+    uploaded = st.file_uploader("Select a CTI configuration JSON file", type=["json"], key="config_backup_upload")
+    replace_current = st.checkbox("Replace the current IOC watchlist", value=False, help="Leave unchecked to merge the backup entries. Detection thresholds are restored either way.")
+    if uploaded is None:
+        st.caption("Restore merges watchlist entries by default. Existing passwords and API settings are never changed.")
+        return
+    raw = uploaded.getvalue()
+    if len(raw) > 2 * 1024 * 1024:
+        st.error("The configuration file is larger than 2 MB.")
+        return
+    try:
+        incoming = json.loads(raw.decode("utf-8"))
+        if not isinstance(incoming, dict):
+            raise ValueError("The uploaded JSON must contain a CTI configuration object.")
+        if incoming.get("format") != "ai-cyber-threat-intelligence-config" or incoming.get("version") != 1:
+            raise ValueError("Unsupported CTI configuration backup format.")
+        st.json({"created_at_utc": incoming.get("created_at_utc"), "indicator_count": len(incoming.get("ioc_watchlist", [])), "detection_settings": incoming.get("detection_settings", {}), "secrets_included": False})
+        if st.button("Restore configuration", type="primary", key="restore_config_button"):
+            count, endpoint_risk, anomaly_score = restore_config_backup(incoming, replace_existing=replace_current)
+            audit_event("configuration_backup_restored", f"entries={count}; replace={replace_current}; endpoint_min_risk={endpoint_risk}; ai_min_score={anomaly_score}")
+            st.success(f"Configuration restored: {count} IOC entries and detection thresholds.")
+            st.rerun()
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, AttributeError) as error:
+        st.error(f"Could not restore this configuration: {error}")
 
 
 def render_audit_log():
@@ -3137,6 +3974,12 @@ def main():
         "Incident Management",
         "Report Generator",
         "Log Analyzer",
+        "IOC Watchlist",
+        "Detection Tuning",
+        "Threat Hunting",
+        "Network Connection Map",
+        "Daily Security Summary",
+        "Configuration Backup",
         "Audit Log & Access",
     ]
     nav_symbols = {
@@ -3154,6 +3997,12 @@ def main():
         "Incident Management": "▣",
         "Report Generator": "▤",
         "Log Analyzer": "⌁",
+        "IOC Watchlist": "◈",
+        "Detection Tuning": "⚙",
+        "Threat Hunting": "⌕",
+        "Network Connection Map": "⇄",
+        "Daily Security Summary": "▤",
+        "Configuration Backup": "▣",
         "Audit Log & Access": "◷",
     }
     st.sidebar.markdown('<div class="cti-sidebar-label">Modules</div>', unsafe_allow_html=True)
@@ -3192,6 +4041,18 @@ def main():
         render_reports(report)
     elif page == "Log Analyzer":
         render_log_analyzer()
+    elif page == "IOC Watchlist":
+        render_ioc_watchlist()
+    elif page == "Detection Tuning":
+        render_detection_tuning()
+    elif page == "Threat Hunting":
+        render_threat_hunting()
+    elif page == "Network Connection Map":
+        render_network_connection_map()
+    elif page == "Daily Security Summary":
+        render_daily_security_summary()
+    elif page == "Configuration Backup":
+        render_config_backup_restore()
     elif page == "Audit Log & Access":
         render_audit_log()
 
