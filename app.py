@@ -635,6 +635,9 @@ def render_page_heading(title):
         "Alert System": "Triage security alerts and prioritize follow-up actions.",
         "Incident Management": "Track investigations, ownership, and response progress.",
         "Report Generator": "Prepare and download security reports for review.",
+        "Custom Detection Rule Builder": "Create and manage metadata-based rules that generate deduplicated alerts.",
+        "Event Correlation Graph": "Visualize endpoint events that share a device, process, IP address, or file hash.",
+        "Multi-device Fleet View": "Track sensor heartbeats and activity across enrolled endpoint devices.",
     }
     description = descriptions.get(title, "Review signals and manage your security workflows.")
     st.markdown(
@@ -836,6 +839,28 @@ def init_database():
                 username TEXT NOT NULL,
                 action TEXT NOT NULL,
                 details TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS custom_detection_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                event_type TEXT NOT NULL DEFAULT '',
+                process_contains TEXT NOT NULL DEFAULT '',
+                remote_ip TEXT NOT NULL DEFAULT '',
+                file_extension TEXT NOT NULL DEFAULT '',
+                min_risk INTEGER NOT NULL DEFAULT 0,
+                output_severity TEXT NOT NULL DEFAULT 'High',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS sensor_registry (
+                sensor_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
             )"""
         )
 
@@ -1471,9 +1496,156 @@ def save_alert_checklist(alert_id, checked_items):
     )
 
 
+def load_custom_detection_rules(enabled_only=False):
+    with connect_db() as connection:
+        query = "SELECT * FROM custom_detection_rules"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY id DESC"
+        return pd.read_sql_query(query, connection)
+
+
+def sync_custom_detection_rules(events):
+    """Apply saved analyst rules to endpoint event metadata and create deduplicated alerts."""
+    if events is None or events.empty:
+        return 0
+    rules = load_custom_detection_rules(enabled_only=True)
+    if rules.empty:
+        return 0
+    suppressions = load_suppression_rules(active_only=True)
+    inserted = 0
+    for event in events.to_dict("records"):
+        event_id = str(event.get("event_id") or event.get("event_uid") or event.get("id") or "").strip()
+        if not event_id:
+            continue
+        event_type = str(event.get("event_type") or "").strip().casefold()
+        process = str(event.get("process_name") or "").strip().casefold()
+        remote_ip = str(event.get("remote_ip") or "").strip()
+        file_name = str(event.get("file_name") or event.get("file_path") or "").strip()
+        extension = Path(file_name).suffix.casefold()
+        try:
+            risk = int(float(event.get("risk_score") or 0))
+        except (TypeError, ValueError):
+            risk = 0
+        try:
+            if matching_suppression_rule(event, suppressions):
+                continue
+        except Exception:
+            pass
+        for rule in rules.to_dict("records"):
+            conditions = [
+                (not rule["event_type"] or event_type == str(rule["event_type"]).casefold()),
+                (not rule["process_contains"] or str(rule["process_contains"]).casefold() in process),
+                (not rule["remote_ip"] or remote_ip == str(rule["remote_ip"])),
+                (not rule["file_extension"] or extension == str(rule["file_extension"]).casefold()),
+                risk >= int(rule["min_risk"] or 0),
+            ]
+            if not all(conditions):
+                continue
+            configured_severity = str(rule["output_severity"] or "High").title()
+            if configured_severity not in {"Medium", "High", "Critical"}:
+                configured_severity = "High"
+            details = [
+                "Source: analyst-defined detection rule",
+                f"Rule: {rule['name']}",
+                f"Matched event: {event_type or 'unknown'}",
+                f"Risk score: {risk}/100",
+            ]
+            for key, label in (("process_name", "Process"), ("remote_ip", "Remote IP"), ("file_name", "File"), ("summary", "Event")):
+                value = str(event.get(key) or "").strip()
+                if value:
+                    details.append(f"{label}: {value[:300]}")
+            source_key = f"custom-rule:{int(rule['id'])}:{event_id}"
+            inserted += int(add_alert(
+                f"Custom rule: {rule['name']}", configured_severity,
+                "\n".join(details), source_event_id=source_key,
+            ))
+    if inserted:
+        audit_event("custom_detection_alerts_created", f"count={inserted}")
+    return inserted
+
+
+def render_detection_rule_builder():
+    render_page_heading("Custom Detection Rule Builder")
+    st.write("Create metadata-based rules. Every condition you fill in must match; blank conditions are ignored.")
+    if not require_admin():
+        st.caption("Analysts can review saved rules; Admin access is required to create, toggle, or delete them.")
+    else:
+        with st.form("custom_detection_rule_form", clear_on_submit=True):
+            name = st.text_input("Rule name", max_chars=100)
+            col1, col2 = st.columns(2)
+            with col1:
+                event_type = st.text_input("Event type (exact, optional)", max_chars=50, placeholder="network_connection")
+                process_contains = st.text_input("Process contains (optional)", max_chars=120, placeholder="powershell")
+            with col2:
+                remote_ip = st.text_input("Remote IP (exact, optional)", max_chars=64)
+                file_extension = st.text_input("File extension (optional)", max_chars=16, placeholder=".exe")
+            min_risk = st.slider("Minimum risk score", 0, 100, 0, 5)
+            output_severity = st.selectbox("Alert severity", ["Medium", "High", "Critical"], index=1)
+            submitted = st.form_submit_button("Save detection rule", type="primary")
+        if submitted:
+            clean_name = name.strip()
+            event_type = event_type.strip()
+            process_contains = process_contains.strip()
+            remote_ip = remote_ip.strip()
+            file_extension = file_extension.strip().casefold()
+            try:
+                if not clean_name or not any((event_type, process_contains, remote_ip, file_extension, min_risk > 0)):
+                    raise ValueError("Add a rule name and at least one matching condition.")
+                if remote_ip:
+                    remote_ip = str(ipaddress.ip_address(remote_ip))
+                if file_extension:
+                    file_extension = file_extension if file_extension.startswith(".") else f".{file_extension}"
+                    if not re.fullmatch(r"\.[a-z0-9]{1,12}", file_extension):
+                        raise ValueError("Enter a file extension such as .exe or .ps1.")
+                with connect_db() as connection:
+                    connection.execute(
+                        """INSERT INTO custom_detection_rules
+                           (name, event_type, process_contains, remote_ip, file_extension, min_risk, output_severity, enabled, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+                           ON CONFLICT(name) DO UPDATE SET event_type=excluded.event_type,
+                           process_contains=excluded.process_contains, remote_ip=excluded.remote_ip,
+                           file_extension=excluded.file_extension, min_risk=excluded.min_risk,
+                           output_severity=excluded.output_severity, enabled=1""",
+                        (clean_name, event_type, process_contains, remote_ip, file_extension, min_risk,
+                         output_severity, datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                    )
+                audit_event("custom_detection_rule_saved", f"name={clean_name[:100]}; severity={output_severity}")
+                st.success("Rule saved. New matching endpoint events will create deduplicated alerts during alert refresh.")
+                st.rerun()
+            except (ValueError, sqlite3.IntegrityError) as error:
+                st.error(str(error) or "Could not save this rule.")
+
+    rules = load_custom_detection_rules()
+    if rules.empty:
+        st.info("No custom rules saved yet.")
+        return
+    display = rules.rename(columns={
+        "name": "Rule", "event_type": "Event type", "process_contains": "Process contains",
+        "remote_ip": "Remote IP", "file_extension": "Extension", "min_risk": "Min risk",
+        "output_severity": "Alert severity", "enabled": "Enabled", "created_at": "Created (UTC)",
+    })
+    display["Enabled"] = display["Enabled"].map({1: "Yes", 0: "No"})
+    st.dataframe(display[["id", "Rule", "Event type", "Process contains", "Remote IP", "Extension", "Min risk", "Alert severity", "Enabled", "Created (UTC)"]], hide_index=True, width="stretch")
+    if is_admin():
+        selected = st.selectbox("Manage rule", rules["id"].astype(int).tolist(), format_func=lambda value: rules.loc[rules["id"].eq(value), "name"].iloc[0])
+        first, second = st.columns(2)
+        selected_rule = rules.loc[rules["id"].eq(selected)].iloc[0]
+        if first.button("Disable rule" if int(selected_rule["enabled"]) else "Enable rule", key="toggle_custom_rule"):
+            with connect_db() as connection:
+                connection.execute("UPDATE custom_detection_rules SET enabled = ? WHERE id = ?", (0 if int(selected_rule["enabled"]) else 1, selected))
+            audit_event("custom_detection_rule_toggled", f"id={selected}; enabled={not bool(selected_rule['enabled'])}")
+            st.rerun()
+        if second.button("Delete rule", key="delete_custom_rule"):
+            with connect_db() as connection:
+                connection.execute("DELETE FROM custom_detection_rules WHERE id = ?", (selected,))
+            audit_event("custom_detection_rule_deleted", f"id={selected}")
+            st.rerun()
+
+
 def sync_endpoint_alerts(events):
     """Turn endpoint events into deduplicated alerts unless an active rule suppresses them."""
-    if events is None or events.empty or "severity" not in events.columns:
+    if events is None or events.empty:
         return 0
 
     severity_map = {"Review": "Medium", "High": "High", "Critical": "Critical"}
@@ -1525,7 +1697,7 @@ def sync_endpoint_alerts(events):
         ))
     if suppressed_count:
         audit_event("endpoint_events_suppressed", f"new_unique_events={suppressed_count}")
-    return inserted
+    return inserted + sync_custom_detection_rules(events)
 
 
 def add_incident(title, severity, notes):
@@ -3735,6 +3907,94 @@ def render_threat_hunting():
         st.success("Correlation alert created." if created else "This exact correlation was already promoted; duplicate alert was skipped.")
 
 
+def render_event_correlation_graph():
+    render_page_heading("Event Correlation Graph")
+    st.write("Explore event links that share a sensor, process, destination IP, or file hash.")
+    st.caption("Links are based on matching endpoint metadata within the selected time window. A relationship is an investigation lead, not proof of an attack.")
+    try:
+        events, source = load_sensor_events(limit=3000)
+    except Exception as error:
+        st.error(f"Could not load endpoint events: {type(error).__name__}")
+        return
+    if events is None or events.empty:
+        st.info("No endpoint events are available to correlate yet.")
+        return
+    data = events.copy()
+    if "sensor_id" not in data:
+        data["sensor_id"] = "Local sensor"
+    time_column = next((column for column in ("occurred_at", "created_at") if column in data), None)
+    lookback_hours = st.select_slider("Correlation window", options=[1, 6, 12, 24, 48, 72, 168], value=24, format_func=lambda value: f"Last {value} hour(s)")
+    if time_column:
+        times = pd.to_datetime(data[time_column], errors="coerce", utc=True)
+        data = data[times.isna() | times.ge(pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=lookback_hours))].copy()
+    if data.empty:
+        st.info("No events are in this time window.")
+        return
+
+    entity_columns = {
+        "Process": "process_name", "Destination IP": "remote_ip",
+        "File hash": "file_sha256", "Sensor": "sensor_id",
+    }
+    options = []
+    for label, column in entity_columns.items():
+        if column in data:
+            values = data[column].dropna().astype(str).str.strip()
+            options.extend((label, value) for value in sorted(set(values) - {""}))
+    if not options:
+        st.info("No shared process, IP, hash, or sensor fields were found in these events.")
+        return
+    labels = [f"{kind}: {value[:90]}" for kind, value in options]
+    selected_index = st.selectbox("Start from an entity", range(len(options)), format_func=lambda index: labels[index])
+    selected_kind, selected_value = options[selected_index]
+    selected_column = entity_columns[selected_kind]
+    related = data[data[selected_column].fillna("").astype(str).eq(selected_value)].copy()
+    if time_column:
+        related = related.sort_values(time_column, ascending=False)
+    related = related.head(20)
+    st.caption(f"Source: {source} · {len(related)} related event(s) in the graph · max 20 for readability")
+    st.metric("Related events", len(related))
+
+    def dot_quote(value):
+        return json.dumps(str(value)[:120], ensure_ascii=True)
+
+    def node_id(kind, value):
+        return f"n_{hashlib.sha256((kind + ':' + str(value)).encode('utf-8')).hexdigest()[:14]}"
+
+    center_id = node_id(selected_kind, selected_value)
+    graph_lines = ["graph CTI {", "  graph [bgcolor=\"transparent\", overlap=false, splines=true];", "  node [style=filled, fontname=Arial, fontsize=10, color=\"#394447\", fontcolor=\"#f2f4ef\"];", "  edge [color=\"#778477\", penwidth=1.2];"]
+    graph_lines.append(f"  {center_id} [label={dot_quote(selected_kind + ': ' + selected_value[:38])}, shape=hexagon, fillcolor=\"#536B42\"];")
+    for index, row in enumerate(related.to_dict("records")):
+        event_key = str(row.get("event_id") or row.get("event_uid") or row.get("id") or index)
+        event_node = node_id("event", event_key)
+        event_type = str(row.get("event_type") or "event")
+        event_time = str(row.get(time_column) or "")[:19] if time_column else ""
+        label = f"{event_type}\n{event_time}\nRisk {row.get('risk_score', 0)}"
+        graph_lines.append(f"  {event_node} [label={dot_quote(label)}, shape=box, fillcolor=\"#26353A\"];")
+        graph_lines.append(f"  {center_id} -- {event_node};")
+        other_entities = (
+            ("Sensor", "sensor_id", "#334b57"),
+            ("Process", "process_name", "#665738"),
+            ("IP", "remote_ip", "#574768"),
+            ("SHA256", "file_sha256", "#6a4444"),
+        )
+        for kind, column, color in other_entities:
+            raw_value = row.get(column)
+            value = "" if raw_value is None or pd.isna(raw_value) else str(raw_value).strip()
+            if not value or (column == selected_column and value == selected_value):
+                continue
+            entity_node = node_id(kind, value)
+            graph_lines.append(f"  {entity_node} [label={dot_quote(kind + ': ' + value[:34])}, shape=ellipse, fillcolor={dot_quote(color)}];")
+            graph_lines.append(f"  {event_node} -- {entity_node};")
+    graph_lines.append("}")
+    try:
+        st.graphviz_chart("\n".join(graph_lines), width="stretch")
+    except Exception:
+        st.info("The graph renderer is unavailable in this installation. Use the related-event table below; install the project requirements to enable the visual graph.")
+    visible_columns = [column for column in ("occurred_at", "created_at", "sensor_id", "event_type", "severity", "risk_score", "summary", "process_name", "remote_ip", "file_name", "file_sha256") if column in related]
+    st.dataframe(related[visible_columns], hide_index=True, width="stretch")
+    st.download_button("Download related events (CSV)", related.to_csv(index=False).encode("utf-8-sig"), "event_correlation.csv", "text/csv")
+
+
 def render_network_connection_map():
     render_page_heading("Network Connection Map")
     st.write("View which processes contacted which public IP addresses, along with observed ports and risk signals.")
@@ -3963,9 +4223,9 @@ def render_config_backup_restore():
 
 
 def render_asset_inventory():
-    render_page_heading("Asset Inventory")
-    st.write("Review endpoint sensors and the processes, installed-application events, and network activity they have reported.")
-    st.caption("This is an observed inventory from sensor telemetry, not a complete software scan. Only the current event window is available.")
+    render_page_heading("Multi-device Fleet View")
+    st.write("Monitor enrolled endpoint sensors together, check their heartbeat, and assign readable names and tags.")
+    st.caption("Device status comes from sensor heartbeats or the latest observed event. Inventory reflects reported telemetry, not a complete device or software scan.")
     try:
         events, source = load_sensor_events(limit=10000)
     except Exception as error:
@@ -4024,12 +4284,54 @@ def render_asset_inventory():
             row["Last heartbeat (UTC)"] = local_report.get("last_heartbeat", "Unknown")
         else:
             row["Last heartbeat (UTC)"] = "Local heartbeat"
+    with connect_db() as connection:
+        for row in sensor_rows:
+            connection.execute(
+                "INSERT OR IGNORE INTO sensor_registry (sensor_id, display_name, tags, updated_at) VALUES (?, '', '', ?)",
+                (row["Sensor ID"], datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            )
+        registry = pd.read_sql_query("SELECT sensor_id, display_name, tags FROM sensor_registry", connection)
+    registry_by_id = {str(item["sensor_id"]): item for item in registry.to_dict("records")}
+    for row in sensor_rows:
+        metadata = registry_by_id.get(row["Sensor ID"], {})
+        row["Device"] = str(metadata.get("display_name") or row["Sensor ID"][:12])
+        row["Tags"] = str(metadata.get("tags") or "")
     st.caption(f"Event source: {source} · Heartbeat source: {heartbeat_source} · Visible sensors: {len(sensor_rows)}")
     if not sensor_rows:
         st.info("No sensor inventory is available yet. Start the endpoint sensor and wait for its first event or heartbeat.")
         return
-    st.dataframe(pd.DataFrame(sensor_rows), hide_index=True, width="stretch")
+    fleet = pd.DataFrame(sensor_rows)
+    metrics = st.columns(4)
+    metrics[0].metric("Devices", len(fleet))
+    metrics[1].metric("Online", int(fleet["Status"].astype(str).eq("Online").sum()))
+    metrics[2].metric("Offline / stale", int(fleet["Status"].astype(str).isin(["Offline", "No recent event"]).sum()))
+    metrics[3].metric("Recent events", int(pd.to_numeric(fleet["Observed events"], errors="coerce").fillna(0).sum()))
+    status_filter = st.multiselect("Device status", sorted(fleet["Status"].dropna().astype(str).unique()), default=sorted(fleet["Status"].dropna().astype(str).unique()), key="fleet_status_filter")
+    filtered_fleet = fleet[fleet["Status"].astype(str).isin(status_filter)]
+    st.dataframe(filtered_fleet, hide_index=True, width="stretch")
+    device_ids = fleet["Sensor ID"].astype(str).tolist()
+    selected_sensor = st.selectbox("Device to label or inspect", device_ids, format_func=lambda value: f"{registry_by_id.get(value, {}).get('display_name') or value[:12]} · {value[:20]}")
+    selected_meta = registry_by_id.get(selected_sensor, {})
+    with st.form("sensor_registry_form"):
+        display_name = st.text_input("Device name", value=str(selected_meta.get("display_name") or ""), max_chars=100)
+        tags = st.text_input("Tags (comma-separated)", value=str(selected_meta.get("tags") or ""), max_chars=200, placeholder="finance, laptop, server")
+        save_device = st.form_submit_button("Save device details")
+    if save_device:
+        with connect_db() as connection:
+            connection.execute(
+                "INSERT INTO sensor_registry (sensor_id, display_name, tags, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(sensor_id) DO UPDATE SET display_name=excluded.display_name, tags=excluded.tags, updated_at=excluded.updated_at",
+                (selected_sensor, display_name.strip(), tags.strip(), datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            )
+        audit_event("fleet_device_details_updated", f"sensor_id={selected_sensor}; name={display_name.strip()[:100]}")
+        st.success("Device details saved.")
+        st.rerun()
     if not events.empty:
+        selected_events = events[events.get("sensor_id", pd.Series("Local sensor", index=events.index)).fillna("Local sensor").astype(str).eq(selected_sensor)].copy()
+        st.markdown("#### Recent activity for selected device")
+        if selected_events.empty:
+            st.info("No event detail was included in the current event window for this device.")
+        else:
+            st.dataframe(selected_events[[column for column in ("occurred_at", "created_at", "event_type", "severity", "risk_score", "process_name", "remote_ip", "summary") if column in selected_events]].head(200), hide_index=True, width="stretch")
         process_rows = events[events.get("process_name", pd.Series("", index=events.index)).notna()].copy()
         if not process_rows.empty:
             st.markdown("#### Recently observed processes")
@@ -4038,7 +4340,7 @@ def render_asset_inventory():
         if not app_rows.empty:
             st.markdown("#### Installed-application events")
             st.dataframe(app_rows[[column for column in ("sensor_id", "occurred_at", "summary", "details") if column in app_rows]].head(300), hide_index=True, width="stretch")
-        st.download_button("Download observed inventory (CSV)", pd.DataFrame(sensor_rows).to_csv(index=False).encode("utf-8-sig"), "observed_asset_inventory.csv", "text/csv")
+        st.download_button("Download fleet inventory (CSV)", fleet.to_csv(index=False).encode("utf-8-sig"), "multi_device_fleet.csv", "text/csv")
 
 
 def render_suppression_rules():
@@ -4503,11 +4805,13 @@ def main():
         "Log Analyzer",
         "IOC Watchlist",
         "Detection Tuning",
+        "Custom Detection Rule Builder",
+        "Event Correlation Graph",
         "Threat Hunting",
         "Network Connection Map",
         "Daily Security Summary",
         "Configuration Backup",
-        "Asset Inventory",
+        "Multi-device Fleet View",
         "Alert Suppression",
         "Scheduled Reports",
         "Access & Roles",
@@ -4533,11 +4837,13 @@ def main():
         "Log Analyzer": "⌁",
         "IOC Watchlist": "◈",
         "Detection Tuning": "⚙",
+        "Custom Detection Rule Builder": "⌘",
+        "Event Correlation Graph": "⤳",
         "Threat Hunting": "⌕",
         "Network Connection Map": "⇄",
         "Daily Security Summary": "▤",
         "Configuration Backup": "▣",
-        "Asset Inventory": "▦",
+        "Multi-device Fleet View": "▦",
         "Alert Suppression": "⊘",
         "Scheduled Reports": "◷",
         "Access & Roles": "♙",
@@ -4584,6 +4890,10 @@ def main():
         render_ioc_watchlist()
     elif page == "Detection Tuning":
         render_detection_tuning()
+    elif page == "Custom Detection Rule Builder":
+        render_detection_rule_builder()
+    elif page == "Event Correlation Graph":
+        render_event_correlation_graph()
     elif page == "Threat Hunting":
         render_threat_hunting()
     elif page == "Network Connection Map":
@@ -4592,7 +4902,7 @@ def main():
         render_daily_security_summary()
     elif page == "Configuration Backup":
         render_config_backup_restore()
-    elif page == "Asset Inventory":
+    elif page == "Multi-device Fleet View":
         render_asset_inventory()
     elif page == "Alert Suppression":
         render_suppression_rules()

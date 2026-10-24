@@ -1,6 +1,7 @@
 pandas
 scikit-learn
 streamlit
+graphviz>=0.20
 scapy
 requests
 reportlab
