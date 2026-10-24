@@ -2640,6 +2640,97 @@ def render_shift_handover_brief(events, alerts, incidents, event_source):
     )
 
 
+def explain_alert_priority(alert, now=None):
+    """Explain a relative alert-triage score from recorded evidence only."""
+    now = now or datetime.now(timezone.utc)
+    severity = str(alert.get("severity") or "Low").title()
+    baseline = {"Critical": 80, "High": 65, "Medium": 42, "Low": 22}.get(severity, 22)
+    score = baseline
+    reasons = [f"{severity} severity sets a {baseline}-point starting priority."]
+    details = str(alert.get("details") or "")
+    title = str(alert.get("title") or "")
+    evidence = f"{title}\n{details}"
+    risk_match = re.search(
+        r"(?:combined\s+ai\s+risk\s+score|ai\s+risk\s+score|risk\s+score|sensor\s+risk)\D{0,16}(\d{1,3})(?:\s*/\s*100)?",
+        evidence,
+        flags=re.IGNORECASE,
+    )
+    if risk_match:
+        risk_score = min(100, int(risk_match.group(1)))
+        score = max(score, risk_score)
+        reasons.append(f"Recorded risk score is {risk_score}/100.")
+
+    lower_evidence = evidence.casefold()
+    ioc_match = any(token in lower_evidence for token in (
+        "threat-intel ioc", "threat-feed ioc", "threat-feed match", "ioc match: yes", "watchlist match",
+    ))
+    if ioc_match:
+        score += 12
+        reasons.append("Threat-intelligence or watchlist evidence is recorded (+12).")
+    if alert.get("mitre_id"):
+        score += 4
+        reasons.append(f"A candidate ATT&CK technique is attached ({str(alert.get('mitre_id'))[:24]}).")
+
+    try:
+        occurrence_count = max(1, int(alert.get("occurrence_count", 1) or 1))
+    except (TypeError, ValueError, OverflowError):
+        occurrence_count = 1
+    if occurrence_count > 1:
+        repeat_points = min(12, (occurrence_count - 1) * 3)
+        score += repeat_points
+        reasons.append(f"The alert groups {occurrence_count} observations (+{repeat_points}).")
+
+    due_at = pd.to_datetime(alert.get("due_at"), errors="coerce", utc=True)
+    if pd.notna(due_at) and due_at.to_pydatetime() < now:
+        score += 12
+        reasons.append("The saved review deadline has passed (+12).")
+    assigned_to = str(alert.get("assigned_to") or "").strip()
+    if not assigned_to and severity in {"Critical", "High"}:
+        score += 5
+        reasons.append("No analyst is assigned to this high-severity alert (+5).")
+    score = min(100, max(0, int(score)))
+
+    if any(token in lower_evidence for token in ("sensor heartbeat", "sensor offline", "sensor health")):
+        next_step = "Check the endpoint sensor heartbeat, process status, and pending upload queue before interpreting missing telemetry."
+    elif any(token in lower_evidence for token in ("file_sha256", "sha-256", "file_created", "file_modified", "file hash")):
+        next_step = "Verify the file origin and signer locally, then check its hash with an approved reputation source. Do not upload file contents."
+    elif any(token in lower_evidence for token in ("remote ip", "remote_ip", "network_connection", "connection", "threat-feed")):
+        next_step = "Validate the destination IP/port and owning process, check the indicator in IOC Analysis, and compare nearby events from the same sensor."
+    elif any(token in lower_evidence for token in ("process_started", "process name", "process_name", "application_installed")):
+        next_step = "Verify the process publisher, parent process, and expected install location; review nearby file and network events."
+    else:
+        next_step = "Review the saved evidence and nearby same-sensor events, then record the analyst's finding in the investigation timeline."
+    return {"score": score, "reasons": reasons, "next_step": next_step, "risk_score": int(risk_match.group(1)) if risk_match else None}
+
+
+def render_alert_priority_explainer(active_alerts):
+    if active_alerts.empty:
+        return
+    st.markdown("#### Explainable alert priority")
+    st.caption("Select an active alert to see why it ranks highly and the next safe verification step.")
+    options = {
+        f"#{int(row['id'])} · {str(row.get('severity', 'Unknown'))} · {str(row.get('title', 'Untitled alert'))[:90]}": index
+        for index, row in active_alerts.iterrows()
+    }
+    selected_label = st.selectbox(
+        "Alert to explain",
+        list(options),
+        key="dashboard_priority_explainer_alert",
+        label_visibility="collapsed",
+    )
+    selected_alert = active_alerts.loc[options[selected_label]].to_dict()
+    explanation = explain_alert_priority(selected_alert)
+    score_col, reasons_col = st.columns([0.35, 0.65])
+    with score_col:
+        st.metric("Triage index", f"{explanation['score']}/100", str(selected_alert.get("severity", "Unknown")))
+    with reasons_col:
+        st.markdown("**Why it ranks here**")
+        for reason in explanation["reasons"]:
+            st.markdown(f"- {reason}")
+    st.info("**Suggested verification:** " + explanation["next_step"])
+    st.caption("The triage index is a transparent prioritization aid, not a probability of compromise or an automated verdict.")
+
+
 def render_dashboard(report):
     endpoint_events = pd.DataFrame()
     event_source = "local"
@@ -2745,6 +2836,7 @@ def render_dashboard(report):
                 priority = priority.sort_values(sort_columns, ascending=[True, False][:len(sort_columns)]).head(8)
                 queue_columns = [name for name in ("created_at", "title", "severity", "status", "assigned_to") if name in priority]
                 st.dataframe(priority[queue_columns], hide_index=True, width="stretch")
+                render_alert_priority_explainer(priority)
     with right:
         with st.container(border=True):
             st.subheader("Network sensor console")
