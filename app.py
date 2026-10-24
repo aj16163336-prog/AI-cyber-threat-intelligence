@@ -1472,6 +1472,80 @@ def validate_watchlist_indicator(indicator_type, value):
     raise ValueError("Choose an IP address, domain, or file hash.")
 
 
+def extract_alert_iocs(alert):
+    """Extract format-valid IPs, domains, and hashes from alert metadata only."""
+    text = "\n".join((str(alert.get("title") or ""), str(alert.get("details") or "")))
+    found = {}
+    for value in re.findall(r"(?<![a-f0-9])(?:[a-f0-9]{128}|[a-f0-9]{64}|[a-f0-9]{40}|[a-f0-9]{32})(?![a-f0-9])", text, flags=re.I):
+        found[("File hash", value.lower())] = True
+    for value in re.findall(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", text):
+        try:
+            found[("IP address", str(ipaddress.ip_address(value)))] = True
+        except ValueError:
+            continue
+    skipped_extensions = {
+        "apk", "asp", "aspx", "bat", "bin", "cmd", "conf", "csv", "dat", "db",
+        "dll", "doc", "docx", "dylib", "exe", "gif", "gz", "htm", "html", "ico", "ini",
+        "jar", "jpeg", "jpg", "js", "json", "log", "md", "md5", "mds", "mkv", "mp3",
+        "mp4", "msi", "pdf", "php", "png", "ps1", "py", "rar", "reg", "sh", "sha1",
+        "sha256", "sha512", "so", "sql", "sqlite", "svg", "sys", "tar", "tmp", "ts",
+        "txt", "war", "webp", "xls", "xlsx", "xml", "yaml", "yml", "zip", "7z",
+    }
+    domain_pattern = r"(?<![\w@.-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}(?![\w.-])"
+    for value in re.findall(domain_pattern, text):
+        try:
+            normalized = validate_watchlist_indicator("Domain", value)
+        except ValueError:
+            continue
+        if normalized.rsplit(".", 1)[-1] in skipped_extensions:
+            continue
+        found[("Domain", normalized)] = True
+    return pd.DataFrame(
+        [{"Type": kind, "Indicator": value} for kind, value in sorted(found)],
+        columns=["Type", "Indicator"],
+    )
+
+
+def render_alert_ioc_extractor(alert):
+    alert_id = int(alert.get("id", 0) or 0)
+    with st.expander("Extract indicators from this alert"):
+        st.caption("Scans only this alert's title and saved metadata. Nothing is sent to an external provider; review each value before adding it to the local IOC Watchlist.")
+        indicators = extract_alert_iocs(alert)
+        if indicators.empty:
+            st.info("No format-valid IP address, domain, or file hash was found in this alert.")
+            return
+        st.dataframe(indicators, hide_index=True, width="stretch")
+        if not is_admin():
+            st.info("An Admin can select an indicator below and add it to the IOC Watchlist.")
+            return
+        choices = {
+            f"{row.Type} · {row.Indicator}": (str(row.Type), str(row.Indicator))
+            for row in indicators.itertuples(index=False)
+        }
+        with st.form(f"alert_ioc_extractor_form_{alert_id}"):
+            selected_label = st.selectbox("Indicator to watch", list(choices), key=f"alert_ioc_choice_{alert_id}")
+            indicator_type, indicator_value = choices[selected_label]
+            label = st.text_input("Watchlist label (optional)", value=f"From alert #{alert_id}", max_chars=120, key=f"alert_ioc_label_{alert_id}")
+            expires = st.checkbox("Expire this watch entry after 30 days", value=True, key=f"alert_ioc_expiry_{alert_id}")
+            submitted = st.form_submit_button("Add selected indicator to watchlist")
+        if submitted:
+            try:
+                normalized = validate_watchlist_indicator(indicator_type, indicator_value)
+                expires_at = (datetime.now(timezone.utc).date() + timedelta(days=30)).isoformat() if expires else None
+                with connect_db() as connection:
+                    connection.execute(
+                        "INSERT INTO ioc_watchlist (indicator_type,indicator_value,label,created_at,enabled,source,expires_at) VALUES (?,?,?,?,1,?,?)",
+                        (indicator_type.lower(), normalized, label.strip()[:120], datetime.now(timezone.utc).isoformat(timespec="seconds"), f"Alert #{alert_id}", expires_at),
+                    )
+                audit_event("alert_ioc_added_to_watchlist", f"alert_id={alert_id}; type={indicator_type}; indicator={normalized}")
+                st.success("Indicator added to the IOC Watchlist.")
+                st.rerun()
+            except sqlite3.IntegrityError:
+                st.info("This indicator is already on the IOC Watchlist.")
+            except ValueError as error:
+                st.error(str(error))
+
+
 def sync_watchlist_alerts(events):
     if events is None or events.empty:
         return 0
@@ -4692,6 +4766,8 @@ def render_alert_system():
         st.caption(f"Created: {selected_alert.get('created_at', 'Unknown')}")
         st.caption(f"MITRE ATT&CK: {selected_alert.get('mitre_id') or 'Not mapped'}")
         st.text(str(selected_alert.get("details") or "No additional evidence was recorded."))
+
+    render_alert_ioc_extractor(selected_alert.to_dict())
 
     st.markdown("#### Investigation and response checklist")
     checklist = load_alert_checklist(selected_id)
