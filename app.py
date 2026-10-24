@@ -979,6 +979,18 @@ def init_database():
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_incident_actions_incident ON incident_follow_up_actions(incident_id, id)")
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS incident_post_reviews (
+                incident_id INTEGER PRIMARY KEY,
+                root_cause TEXT NOT NULL DEFAULT '',
+                impact TEXT NOT NULL DEFAULT '',
+                lessons_learned TEXT NOT NULL DEFAULT '',
+                prevention_steps TEXT NOT NULL DEFAULT '',
+                review_status TEXT NOT NULL DEFAULT 'Draft',
+                updated_by TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS response_playbook_progress (
                 alert_id INTEGER NOT NULL,
                 step_key TEXT NOT NULL,
@@ -1487,6 +1499,39 @@ def update_incident_follow_up_action(action_id, incident_id, status):
     record_incident_timeline(int(incident_id), "Follow-up action status changed", f"Action #{action_id} ({row[0]}): {row[1]} → {status}")
     audit_event("incident_follow_up_action_status_changed", f"incident_id={incident_id}; action_id={action_id}; status={status}")
     return True
+
+
+def load_incident_post_review(incident_id):
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT root_cause, impact, lessons_learned, prevention_steps, review_status, updated_by, updated_at "
+            "FROM incident_post_reviews WHERE incident_id = ?",
+            (int(incident_id),),
+        ).fetchone()
+    if not row:
+        return {"root_cause":"", "impact":"", "lessons_learned":"", "prevention_steps":"", "review_status":"Draft", "updated_by":"", "updated_at":""}
+    return dict(zip(("root_cause", "impact", "lessons_learned", "prevention_steps", "review_status", "updated_by", "updated_at"), row))
+
+
+def save_incident_post_review(incident_id, root_cause, impact, lessons_learned, prevention_steps, review_status):
+    values = [str(value).strip()[:4000] for value in (root_cause, impact, lessons_learned, prevention_steps)]
+    if review_status not in {"Draft", "Reviewed"}:
+        raise ValueError("Choose Draft or Reviewed.")
+    if review_status == "Reviewed" and any(not value for value in values):
+        raise ValueError("Complete root cause, impact, lessons learned, and prevention steps before marking the review as Reviewed.")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    actor = str(st.session_state.get("username", "Analyst"))[:120]
+    with connect_db() as connection:
+        connection.execute(
+            "INSERT INTO incident_post_reviews (incident_id, root_cause, impact, lessons_learned, prevention_steps, review_status, updated_by, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(incident_id) DO UPDATE SET "
+            "root_cause=excluded.root_cause, impact=excluded.impact, lessons_learned=excluded.lessons_learned, "
+            "prevention_steps=excluded.prevention_steps, review_status=excluded.review_status, "
+            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+            (int(incident_id), *values, review_status, actor, now),
+        )
+    record_incident_timeline(int(incident_id), "Post-incident review updated", f"Review status: {review_status}; updated by {actor}.")
+    audit_event("incident_post_review_saved", f"incident_id={incident_id}; status={review_status}")
 
 
 def get_detection_settings():
@@ -2587,7 +2632,7 @@ def make_pdf(report):
     return buffer.getvalue()
 
 
-def make_incident_evidence_zip(incident, alerts, timeline, follow_up_actions=None):
+def make_incident_evidence_zip(incident, alerts, timeline, follow_up_actions=None, post_review=None):
     """Package incident metadata, linked evidence records and their timelines."""
     incident_id = int(incident.get("id"))
     alert_ids = [int(value) for value in alerts.get("id", pd.Series(dtype=int)).dropna().tolist()] if alerts is not None and not alerts.empty else []
@@ -2608,7 +2653,7 @@ def make_incident_evidence_zip(incident, alerts, timeline, follow_up_actions=Non
         "AI Cyber Threat Intelligence — Incident Evidence Bundle\n"
         f"Incident ID: {incident_id}\n"
         f"Generated (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
-        "Contents: incident.json, linked_alerts.csv, incident_timeline.csv, follow_up_actions.csv, alert_timelines.csv, ioc_matches.csv, log_findings.csv.\n"
+        "Contents: incident.json, linked_alerts.csv, incident_timeline.csv, follow_up_actions.csv, post_incident_review.csv, alert_timelines.csv, ioc_matches.csv, log_findings.csv.\n"
         "Original uploaded log files are not retained by the application and are not included. Log finding alert records contain the saved reason and limited excerpt.\n"
         "Indicators and automated correlations are investigation leads, not confirmed malware verdicts."
     )
@@ -2619,6 +2664,8 @@ def make_incident_evidence_zip(incident, alerts, timeline, follow_up_actions=Non
         bundle.writestr("linked_alerts.csv", alerts.to_csv(index=False).encode("utf-8-sig") if alerts is not None and not alerts.empty else b"id,title,severity,status\n")
         bundle.writestr("incident_timeline.csv", timeline.to_csv(index=False).encode("utf-8-sig") if timeline is not None and not timeline.empty else b"occurred_at,event_type,actor,note\n")
         bundle.writestr("follow_up_actions.csv", follow_up_actions.to_csv(index=False).encode("utf-8-sig") if follow_up_actions is not None and not follow_up_actions.empty else b"id,incident_id,title,owner,due_at,status,created_at,updated_at\n")
+        review_frame = pd.DataFrame([post_review]) if post_review and post_review.get("updated_at") else pd.DataFrame(columns=["root_cause", "impact", "lessons_learned", "prevention_steps", "review_status", "updated_by", "updated_at"])
+        bundle.writestr("post_incident_review.csv", review_frame.to_csv(index=False).encode("utf-8-sig"))
         bundle.writestr("alert_timelines.csv", alert_timeline.to_csv(index=False).encode("utf-8-sig"))
         bundle.writestr("ioc_matches.csv", ioc_matches.to_csv(index=False).encode("utf-8-sig"))
         bundle.writestr("log_findings.csv", log_findings.to_csv(index=False).encode("utf-8-sig"))
@@ -5112,6 +5159,28 @@ def render_incident_management():
             st.rerun()
         except ValueError as error:
             st.error(str(error))
+    st.markdown("#### Post-incident review")
+    st.caption("Capture a concise root-cause and lessons-learned record after investigation. Saving updates the incident timeline; mark Reviewed only when the team has completed its review.")
+    post_review = load_incident_post_review(int(selected_id))
+    with st.form(f"incident_post_review_form_{selected_id}"):
+        review_columns = st.columns(2)
+        review_root_cause = review_columns[0].text_area("Root cause", value=post_review["root_cause"], max_chars=4000, key=f"review_root_cause_{selected_id}")
+        review_impact = review_columns[1].text_area("Impact", value=post_review["impact"], max_chars=4000, key=f"review_impact_{selected_id}")
+        review_lessons = review_columns[0].text_area("Lessons learned", value=post_review["lessons_learned"], max_chars=4000, key=f"review_lessons_{selected_id}")
+        review_prevention = review_columns[1].text_area("Prevention steps", value=post_review["prevention_steps"], max_chars=4000, key=f"review_prevention_{selected_id}")
+        review_status_options = ["Draft", "Reviewed"]
+        review_status_index = review_status_options.index(post_review["review_status"]) if post_review["review_status"] in review_status_options else 0
+        review_status = st.selectbox("Review status", review_status_options, index=review_status_index, key=f"review_status_{selected_id}")
+        review_submitted = st.form_submit_button("Save post-incident review")
+    if review_submitted:
+        try:
+            save_incident_post_review(int(selected_id), review_root_cause, review_impact, review_lessons, review_prevention, review_status)
+            st.success("Post-incident review saved and recorded in the incident timeline.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
+    if post_review.get("updated_at"):
+        st.caption(f"Last updated by {post_review.get('updated_by') or 'Analyst'} at {post_review['updated_at']} UTC · {post_review['review_status']}")
     csv_parts = []
     summary_row = selected_incident.to_frame().T
     summary_row.insert(0, "record_type", "incident")
@@ -5128,6 +5197,10 @@ def render_incident_management():
         actions_export = actions.copy()
         actions_export.insert(0, "record_type", "follow_up_action")
         csv_parts.append(actions_export)
+    if post_review.get("updated_at"):
+        review_export = pd.DataFrame([post_review])
+        review_export.insert(0, "record_type", "post_incident_review")
+        csv_parts.append(review_export)
     export_frame = pd.concat(csv_parts, ignore_index=True, sort=False)
     stem = f"incident_{int(selected_id)}_report"
     csv_bytes = export_frame.to_csv(index=False).encode("utf-8-sig")
@@ -5139,7 +5212,7 @@ def render_incident_management():
     with right:
         if st.download_button("Download incident report (PDF)", pdf_bytes, f"{stem}.pdf", "application/pdf", key=f"incident_pdf_{selected_id}"):
             audit_event("incident_report_exported", f"incident_id={selected_id}; format=pdf")
-    evidence_zip = make_incident_evidence_zip(selected_incident, linked_alerts, timeline, actions)
+    evidence_zip = make_incident_evidence_zip(selected_incident, linked_alerts, timeline, actions, post_review)
     if st.download_button("Download incident evidence bundle (ZIP)", evidence_zip, f"incident_{int(selected_id)}_evidence.zip", "application/zip", key=f"incident_bundle_{selected_id}"):
         audit_event("incident_evidence_bundle_exported", f"incident_id={selected_id}; linked_alerts={len(linked_alerts)}")
 
