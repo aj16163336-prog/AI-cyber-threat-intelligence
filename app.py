@@ -424,26 +424,26 @@ def apply_theme():
         """
         <style>
         :root {
-            --cti-bg: #0b0d0c;
-            --cti-panel: #141715;
-            --cti-panel-raised: #191d1a;
-            --cti-border: #2a302c;
-            --cti-ink: #f2f3ef;
-            --cti-muted: #9ba29b;
-            --cti-lime: #cede62;
-            --cti-olive: #8a852b;
-            --cti-red: #e67d73;
+            --cti-bg: #080e16;
+            --cti-panel: #101923;
+            --cti-panel-raised: #152230;
+            --cti-border: #263746;
+            --cti-ink: #e8f0f7;
+            --cti-muted: #8fa1b1;
+            --cti-lime: #56d9cf;
+            --cti-olive: #3d83b6;
+            --cti-red: #f27a83;
         }
         @keyframes cti-arrive {
             from { opacity: 0; transform: translateY(8px); }
             to { opacity: 1; transform: translateY(0); }
         }
         @keyframes cti-signal-pulse {
-            0%, 100% { box-shadow: 0 0 0 0 #cede6220, 0 0 12px #cede6270; }
-            50% { box-shadow: 0 0 0 5px #cede6208, 0 0 18px #cede6280; }
+            0%, 100% { box-shadow: 0 0 0 0 #56d9cf20, 0 0 12px #56d9cf70; }
+            50% { box-shadow: 0 0 0 5px #56d9cf08, 0 0 18px #56d9cf80; }
         }
         html, body, [data-testid="stAppViewContainer"] {
-            background: radial-gradient(ellipse at 80% 0%, #171a15 0%, var(--cti-bg) 42%);
+            background: radial-gradient(ellipse at 80% 0%, #132332 0%, var(--cti-bg) 42%);
             color: var(--cti-ink);
             font-family: Inter, "Segoe UI", sans-serif;
             color-scheme: dark;
@@ -532,7 +532,7 @@ def apply_theme():
         }
         [data-testid="stSidebar"] [role="radiogroup"] label:hover { background: #202520; }
         [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
-            background: #24291f; color: var(--cti-lime);
+            background: #12313a; color: var(--cti-lime);
             box-shadow: inset 2px 0 0 var(--cti-lime);
         }
         [data-testid="stSidebar"] [role="radiogroup"] label p { color: inherit; }
@@ -545,7 +545,7 @@ def apply_theme():
         [data-testid="stButton"] button:hover, [data-testid="stDownloadButton"] button:hover {
             border-color: var(--cti-lime); color: var(--cti-lime);
             transform: translateY(-1px);
-            box-shadow: 0 5px 16px #cede6215;
+            box-shadow: 0 5px 16px #56d9cf15;
         }
         [data-testid="stButton"] button, [data-testid="stDownloadButton"] button,
         [data-testid="stFormSubmitButton"] button {
@@ -574,7 +574,7 @@ def apply_theme():
         .cti-session {
             display:flex; align-items:center; gap:.55rem; margin:.5rem 0 1rem;
             padding:.65rem .75rem; border:1px solid #303a2b; border-radius:10px;
-            background:#1b2118; color:#d5e28a; font-size:.78rem; font-weight:600;
+            background:#102b31; color:#a7f0e8; font-size:.78rem; font-weight:600;
         }
         .cti-dot { width:.48rem; height:.48rem; border-radius:50%; background:var(--cti-lime); animation:cti-signal-pulse 2.4s ease-in-out infinite; }
         .cti-page-heading {
@@ -587,49 +587,59 @@ def apply_theme():
         .cti-status {
             flex:0 0 auto; display:flex; align-items:center; gap:.5rem;
             padding:.5rem .72rem; border:1px solid #333a2e; border-radius:999px;
-            color:#d5e28a; background:#171c15; font-size:.67rem; font-weight:700; letter-spacing:.09em;
+            color:#a7f0e8; background:#10232c; font-size:.67rem; font-weight:700; letter-spacing:.09em;
         }
         .cti-hero {
             display:flex; justify-content:space-between; align-items:center; gap:1rem;
             padding:1.5rem 1.6rem; margin-bottom:1.15rem; border:1px solid #323a2f;
             border-radius:16px; background:linear-gradient(115deg,#1b2018 0%,#141715 70%);
-            box-shadow:inset 3px 0 0 #cede6240, 0 12px 35px #00000015;
+            box-shadow:inset 3px 0 0 #56d9cf55, 0 12px 35px #00000025;
             transition:transform .2s ease, border-color .2s ease;
         }
-        .cti-hero:hover { transform:translateY(-2px); border-color:#596137; }
+        .cti-hero:hover { transform:translateY(-2px); border-color:#337a81; }
         .cti-hero h2 { margin:.35rem 0 .45rem; font-size:1.45rem; }
         .cti-hero p { margin:0; max-width:48rem; }
         .cti-hero-mark {
             display:grid; place-items:center; flex:0 0 3.5rem; height:3.5rem;
-            border:1px solid #596137; border-radius:1rem; color:var(--cti-lime);
-            background:#272b1d; font-size:1.35rem;
+            border:1px solid #337a81; border-radius:1rem; color:var(--cti-lime);
+            background:#102b36; font-size:1.35rem;
         }
         .cti-section-label { margin:.35rem 0 .7rem; color:#a7ad9f; font-size:.68rem; font-weight:700; letter-spacing:.14em; text-transform:uppercase; }
+        .cti-workbench-rail {
+            display:flex; flex-wrap:wrap; justify-content:space-between; gap:.65rem 1.2rem;
+            margin:-.25rem 0 1rem; padding:.68rem .9rem;
+            border:1px solid #263b4b; border-radius:10px;
+            background:linear-gradient(90deg,#0d1b27,#0c1721 70%,#10232b);
+            color:#9db1c0; font-family:ui-monospace,SFMono-Regular,Consolas,monospace;
+            font-size:.68rem; letter-spacing:.055em;
+        }
+        .cti-workbench-rail span { display:flex; align-items:center; gap:.48rem; }
+        .cti-rail-live { width:.45rem; height:.45rem; border-radius:50%; background:#56d9cf; box-shadow:0 0 10px #56d9cf90; }
         .cti-login-title { margin:.55rem 0 1rem; color:var(--cti-ink); font-size:clamp(2.2rem,4vw,3.7rem); font-weight:700; line-height:1.05; letter-spacing:-.06em; }
         .cti-login-title span { color:var(--cti-lime); }
         .cti-login-copy { max-width:34rem; color:#a6ada5; font-size:1rem; line-height:1.7; }
         .cti-login-points { margin-top:2rem; color:#c4c9c1; font-size:.86rem; line-height:2.2; }
         /* Refined command-center styling: clearer hierarchy and consistent
            interaction states across the dashboard widgets. */
-        ::selection { color:#11130c; background:#cede62; }
+        ::selection { color:#081217; background:#56d9cf; }
         [data-testid="stAppViewContainer"] {
             background:
-                radial-gradient(ellipse at 88% 4%, #252b1b 0%, transparent 34%),
-                radial-gradient(ellipse at 8% 100%, #151c19 0%, transparent 30%),
-                #0b0d0c;
+                radial-gradient(ellipse at 88% 4%, #163045 0%, transparent 34%),
+                radial-gradient(ellipse at 8% 100%, #102a32 0%, transparent 30%),
+                #080e16;
         }
         [data-testid="stMainBlockContainer"] { padding-top:2.35rem; }
         [data-testid="stHeader"] { backdrop-filter:blur(14px); }
         [data-testid="stSidebar"] {
-            background:linear-gradient(180deg,#151916 0%,#101311 58%,#0e100f 100%);
+            background:linear-gradient(180deg,#101b27 0%,#0b141e 58%,#080f17 100%);
             box-shadow:12px 0 36px #00000018;
         }
         [data-testid="stSidebar"] [role="radiogroup"] label {
             min-height:2.45rem; border:1px solid transparent;
         }
         [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
-            border-color:#cede6233;
-            background:linear-gradient(100deg,#303522 0%,#20241c 100%);
+            border-color:#56d9cf44;
+            background:linear-gradient(100deg,#16333c 0%,#14232e 100%);
             box-shadow:inset 3px 0 0 var(--cti-lime),0 5px 16px #00000020;
         }
         [data-testid="stSidebar"] [role="radiogroup"] label p {
@@ -643,15 +653,28 @@ def apply_theme():
         }
         [data-testid="stMetric"]::after {
             content:""; position:absolute; inset:0 0 auto; height:2px;
-            background:linear-gradient(90deg,#cede6280,transparent 78%);
+            background:linear-gradient(90deg,#56d9cf90,transparent 78%);
             opacity:.65;
         }
         [data-testid="stMetricValue"] { font-size:clamp(1.45rem,2vw,2rem); }
         [data-testid="stDataFrame"], [data-testid="stTable"] {
             box-shadow:0 10px 26px #0000001a;
         }
-        [data-testid="stDataFrame"] th { color:#dfe6d1 !important; }
-        [data-testid="stDataFrame"] tr:hover td { background:#cede620b !important; }
+        [data-testid="stDataFrame"] th { color:#cce4ec !important; }
+        [data-testid="stDataFrame"] tr:hover td { background:#56d9cf0b !important; }
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            background:linear-gradient(145deg,#111f2b 0%,#0d1721 100%);
+            box-shadow:inset 0 1px #ffffff06,0 10px 28px #00000020;
+        }
+        [data-testid="stVerticalBlockBorderWrapper"] h2,
+        [data-testid="stVerticalBlockBorderWrapper"] h3 {
+            color:#cde3ec; letter-spacing:.015em;
+        }
+        [data-testid="stMetric"] {
+            background:linear-gradient(150deg,#142330 0%,#0f1923 100%);
+            border-color:#273b4b;
+        }
+        [data-testid="stMetric"]:has([data-testid="stMetricValue"]) { border-top:2px solid #56d9cf38; }
         [data-testid="stExpander"] {
             border:1px solid var(--cti-border); border-radius:12px;
             background:#121513;
@@ -663,14 +686,14 @@ def apply_theme():
             border-radius:9px 9px 0 0; color:#aeb5aa;
         }
         [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
-            color:var(--cti-lime); background:#cede620c;
+            color:var(--cti-lime); background:#56d9cf0c;
         }
         [data-testid="stTextInput"] input:focus,
         [data-testid="stTextArea"] textarea:focus,
         [data-testid="stNumberInput"] input:focus,
         [data-testid="stDateInput"] input:focus {
-            border-color:#cede62 !important;
-            box-shadow:0 0 0 2px #cede6222 !important;
+            border-color:#56d9cf !important;
+            box-shadow:0 0 0 2px #56d9cf22 !important;
         }
         [data-testid="stButton"] button:focus-visible,
         [data-testid="stDownloadButton"] button:focus-visible,
@@ -681,11 +704,12 @@ def apply_theme():
         ::-webkit-scrollbar { width:10px; height:10px; }
         ::-webkit-scrollbar-track { background:#0d100e; }
         ::-webkit-scrollbar-thumb { background:#343a31; border:2px solid #0d100e; border-radius:99px; }
-        ::-webkit-scrollbar-thumb:hover { background:#626b4b; }
+        ::-webkit-scrollbar-thumb:hover { background:#3d83b6; }
         @media (max-width: 760px) {
             [data-testid="stMainBlockContainer"] { padding:1.2rem 1rem 2rem; }
             .cti-page-heading { align-items:flex-start; flex-direction:column; }
             .cti-hero { align-items:flex-start; }
+            .cti-workbench-rail { justify-content:flex-start; }
         }
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; scroll-behavior:auto !important; transition-duration:.01ms !important; }
@@ -2500,24 +2524,32 @@ def render_dashboard(report):
     alerts = load_alerts()
     incidents = load_incidents()
     live = st.session_state.get("live_summary", {})
-    total_records = len(report)
-    critical = (
-        int((report["risk_level"].astype(str) == "Critical").sum())
-        if "risk_level" in report.columns
-        else 0
-    )
-    open_alerts = int((alerts["status"] == "Open").sum()) if not alerts.empty else 0
+    active_alerts = alerts[alerts["status"].isin(["Open", "Acknowledged"])].copy() if not alerts.empty else alerts
+    open_alerts = int((active_alerts["status"] == "Open").sum()) if not active_alerts.empty else 0
+    critical = int((active_alerts["severity"].astype(str).str.casefold() == "critical").sum()) if not active_alerts.empty and "severity" in active_alerts else 0
     open_incidents = int((incidents["status"] == "Open").sum()) if not incidents.empty else 0
 
     st.markdown(
         """
         <div class="cti-page-heading">
           <div>
-            <div class="cti-eyebrow">Security operations / overview</div>
-            <h1>Threat operations</h1>
-            <p>Endpoint activity, network signals, and model findings in one workspace.</p>
+            <div class="cti-eyebrow">SOC / analyst workstation</div>
+            <h1>Security operations desk</h1>
+            <p>Monitor sensor health, triage the active alert queue, and move investigations forward.</p>
           </div>
-          <div class="cti-status"><span class="cti-dot"></span> SECURITY CONSOLE</div>
+          <div class="cti-status"><span class="cti-dot"></span> SHIFT ACTIVE</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+        <div class="cti-workbench-rail">
+          <span><b class="cti-rail-live"></b>{str(event_source).upper()} EVENT STREAM</span>
+          <span>OPERATOR: {str(st.session_state.get('user_role', 'Analyst')).upper()}</span>
+          <span>CONSOLE TIME: {datetime.now().astimezone().strftime('%H:%M:%S')}</span>
+          <span>ACTIVE QUEUE: {len(active_alerts)}</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2527,20 +2559,20 @@ def render_dashboard(report):
         """
         <div class="cti-hero">
           <div>
-            <div class="cti-eyebrow">Operations snapshot</div>
-            <h2>Stay ahead of suspicious activity</h2>
-            <p>Review new endpoint events, prioritize critical findings, and track the response queue.</p>
+            <div class="cti-eyebrow">Current shift / operational picture</div>
+            <h2>Investigate the strongest signals first</h2>
+            <p>Use correlated telemetry and alert evidence to validate activity, assign ownership, and document each decision.</p>
           </div>
-          <div class="cti-hero-mark">⌁</div>
+          <div class="cti-hero-mark">⌖</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Recent endpoint events", len(endpoint_events))
+    col1.metric("Endpoint events", len(endpoint_events), help="Recent events available to this dashboard.")
     col2.metric("Open alerts", open_alerts)
-    col3.metric("Critical model risks", critical)
+    col3.metric("Critical queue", critical)
     col4.metric("Open incidents", open_incidents)
 
     @st.fragment(run_every="5s")
@@ -2561,35 +2593,34 @@ def render_dashboard(report):
                 counts = report["risk_level"].astype(str).value_counts().reindex(
                     ["Low", "Medium", "High", "Critical"], fill_value=0
                 )
-                st.bar_chart(counts, color="#CEDE62")
+                st.bar_chart(counts, color="#56D9CF")
         with right:
             with st.container(border=True):
                 st.subheader("Attack categories")
                 if "predicted_category" in report.columns:
-                    st.bar_chart(report["predicted_category"].value_counts().head(8), color="#8A852B")
+                    st.bar_chart(report["predicted_category"].value_counts().head(8), color="#3D83B6")
                 else:
                     st.info("Attack-category predictions are not available in this report.")
 
-    left, right = st.columns([1.1, 0.9], gap="large")
+    left, right = st.columns([1.15, 0.85], gap="large")
     with left:
         with st.container(border=True):
-            st.subheader("Recent endpoint activity")
-            st.caption("Source: deployed API" if event_source == "cloud" else "Source: this computer")
-            if endpoint_events.empty:
-                st.info("No endpoint events yet. Start the local sensor to begin collecting events.")
+            st.subheader("Priority alert queue")
+            st.caption("Open and acknowledged alerts, ordered by severity for analyst triage.")
+            if active_alerts.empty:
+                st.success("Queue clear. No open or acknowledged alerts.")
             else:
-                recent = endpoint_events.head(8).copy()
-                if "created_at" in recent.columns and "occurred_at" not in recent.columns:
-                    recent = recent.rename(columns={"created_at": "occurred_at"})
-                columns = [
-                    name for name in
-                    ("occurred_at", "event_type", "severity", "summary", "risk_score")
-                    if name in recent.columns
-                ]
-                st.dataframe(recent[columns], hide_index=True, width="stretch")
+                priority = active_alerts.copy()
+                priority["_priority"] = priority["severity"].astype(str).str.title().map(
+                    {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+                ).fillna(4)
+                sort_columns = ["_priority"] + (["created_at"] if "created_at" in priority else [])
+                priority = priority.sort_values(sort_columns, ascending=[True, False][:len(sort_columns)]).head(8)
+                queue_columns = [name for name in ("created_at", "title", "severity", "status", "assigned_to") if name in priority]
+                st.dataframe(priority[queue_columns], hide_index=True, width="stretch")
     with right:
         with st.container(border=True):
-            st.subheader("Live network monitor")
+            st.subheader("Network sensor console")
             if live:
                 a, b = st.columns(2)
                 a.metric("Packets captured", live["packets"])
@@ -2599,6 +2630,18 @@ def render_dashboard(report):
                 st.info("No capture summary yet. Start a capture from Live Monitor.")
 
             render_dashboard_alert_inbox()
+
+    with st.container(border=True):
+        st.subheader("Latest endpoint telemetry")
+        st.caption("Source: deployed API" if event_source == "cloud" else "Source: this computer")
+        if endpoint_events.empty:
+            st.info("No endpoint events yet. Start the local sensor to begin collecting events.")
+        else:
+            recent = endpoint_events.head(10).copy()
+            if "created_at" in recent.columns and "occurred_at" not in recent.columns:
+                recent = recent.rename(columns={"created_at": "occurred_at"})
+            columns = [name for name in ("occurred_at", "sensor_id", "event_type", "severity", "summary", "risk_score") if name in recent]
+            st.dataframe(recent[columns], hide_index=True, width="stretch")
 
 
 def render_live_monitor():
@@ -6018,9 +6061,9 @@ def main():
     if "user_role" not in st.session_state:
         st.session_state["user_role"] = "Admin"
     st.sidebar.markdown(
-        '<div class="cti-brand"><div class="cti-brand-mark">CTI</div>'
-        '<div><div class="cti-brand-name">CYBER INTEL</div>'
-        '<span class="cti-brand-sub">THREAT OPERATIONS</span></div></div>',
+        '<div class="cti-brand"><div class="cti-brand-mark">SOC</div>'
+        '<div><div class="cti-brand-name">SOC WORKSTATION</div>'
+        '<span class="cti-brand-sub">LIVE THREAT OPERATIONS</span></div></div>',
         unsafe_allow_html=True,
     )
     st.sidebar.markdown(
