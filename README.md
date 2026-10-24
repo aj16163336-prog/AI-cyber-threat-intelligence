@@ -2,6 +2,8 @@
 
 Windows endpoint and network monitoring project with a local sensor, authenticated event API, threat-feed lookups, analyst dashboard, alert/incident tracking, and CSV/PDF reports.
 
+For a short, teacher-friendly walkthrough and demo checklist, see [PRESENTATION_GUIDE.md](PRESENTATION_GUIDE.md).
+
 ## Current monitoring scope
 
 - Local sensor watches `Downloads`, `Desktop`, and `Documents` for file create, move, and modification events; it calculates SHA-256 locally for files up to 100 MB.
