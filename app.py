@@ -3349,6 +3349,35 @@ def render_live_ai_panel(show_assistant=False, live_openai_enabled=False):
         st.dataframe(chains[chain_columns], hide_index=True, width="stretch")
         if chain_alerts:
             st.success(f"Created {chain_alerts} new attack-chain review alert(s).")
+    cross_sensor = detect_cross_sensor_correlations(events)
+    st.subheader("Cross-sensor threat correlation")
+    st.caption("Finds the same public IP or SHA-256 on multiple sensors. Shared public IPs are shown only when IOC-matched or risk is elevated. Matches are leads for review, not proof of compromise.")
+    if cross_sensor.empty:
+        st.info("No qualifying indicators are currently shared across multiple sensors. Connect another sensor or collect more endpoint events to use cross-sensor correlation.")
+    else:
+        display_correlations = cross_sensor.copy()
+        display_correlations["Indicator"] = display_correlations.apply(
+            lambda row: row["Indicator"] if row["Indicator type"] == "Public IP" else str(row["Indicator"])[:16] + "…",
+            axis=1,
+        )
+        st.dataframe(display_correlations, hide_index=True, width="stretch")
+        correlation_options = {
+            f"{row['Indicator type']} · {row['Indicator'] if row['Indicator type'] == 'Public IP' else str(row['Indicator'])[:16] + '…'} · {row['Sensor count']} sensors": index
+            for index, row in cross_sensor.iterrows()
+        }
+        selected_correlation = st.selectbox(
+            "Select a correlation to investigate",
+            list(correlation_options),
+            key="ai_cross_sensor_candidate",
+        )
+        if st.button("Create investigation alert", key="ai_cross_sensor_create_alert"):
+            created = create_cross_sensor_correlation_alert(
+                cross_sensor.iloc[correlation_options[selected_correlation]].to_dict()
+            )
+            if created:
+                st.success("Cross-sensor investigation alert created and added to the notification center.")
+            else:
+                st.info("A matching alert is already open or was previously recorded.")
     render_ai_rule_suggestions(events)
     anomalies = events[events["AI anomaly"]]
     if not anomalies.empty:
@@ -3512,6 +3541,104 @@ def detect_ai_attack_chains(events):
             "Evidence": "; ".join(item for item in summaries if item)[:1200],
         })
     return pd.DataFrame(rows).sort_values("Risk score", ascending=False) if rows else pd.DataFrame()
+
+
+def detect_cross_sensor_correlations(events):
+    """Find high-signal public IP or SHA-256 indicators shared across sensors."""
+    if events is None or events.empty or "sensor_id" not in events:
+        return pd.DataFrame()
+    data = events.copy()
+    data["_sensor"] = data["sensor_id"].fillna("").astype(str).str.strip()
+    data = data[data["_sensor"].ne("")].copy()
+    if data.empty:
+        return pd.DataFrame()
+    risk_column = "AI risk score" if "AI risk score" in data else "risk_score"
+    data["_risk"] = pd.to_numeric(data.get(risk_column, pd.Series(0, index=data.index)), errors="coerce").fillna(0).clip(0, 100)
+    if "Threat-intel IOC" in data:
+        data["_ioc"] = data["Threat-intel IOC"].map(
+            lambda value: str(value).strip().lower() in {"1", "true", "yes"} if isinstance(value, str) else bool(value) if pd.notna(value) else False
+        )
+    else:
+        data["_ioc"] = False
+    time_column = next((name for name in ("occurred_at", "created_at") if name in data), None)
+    data["_seen"] = pd.to_datetime(data[time_column], errors="coerce", utc=True) if time_column else pd.NaT
+    candidates = []
+    for column, indicator_type in (("remote_ip", "Public IP"), ("file_sha256", "SHA-256")):
+        if column not in data:
+            continue
+        indicators = data[column].fillna("").astype(str).str.strip().str.lower()
+        valid = []
+        for value in indicators:
+            try:
+                if indicator_type == "Public IP":
+                    valid.append(value if value and ipaddress.ip_address(value).is_global else "")
+                else:
+                    valid.append(value if re.fullmatch(r"[a-f0-9]{64}", value) else "")
+            except ValueError:
+                valid.append("")
+        data["_indicator"] = valid
+        grouped = data[data["_indicator"].ne("")].groupby("_indicator", sort=False)
+        for indicator, group in grouped:
+            sensor_ids = sorted(group["_sensor"].unique().tolist())
+            if len(sensor_ids) < 2:
+                continue
+            ioc_match = bool(group["_ioc"].any())
+            highest_risk = int(group["_risk"].max())
+            # Avoid noisy shared infrastructure IPs; a multi-device IP must also
+            # have an IOC match or elevated event risk. Exact file hashes are rarer.
+            if indicator_type == "Public IP" and not ioc_match and highest_risk < 70:
+                continue
+            times = group["_seen"].dropna()
+            event_types = sorted(group.get("event_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+            candidates.append({
+                "Indicator type": indicator_type,
+                "Indicator": indicator,
+                "Sensor count": len(sensor_ids),
+                "Sensors": ", ".join(sensor_ids[:8]),
+                "Event count": len(group),
+                "Highest AI risk": highest_risk,
+                "IOC match": ioc_match,
+                "Event types": ", ".join(event_types[:8]),
+                "First seen (UTC)": times.min().isoformat() if not times.empty else "Unknown",
+                "Last seen (UTC)": times.max().isoformat() if not times.empty else "Unknown",
+            })
+    if not candidates:
+        return pd.DataFrame()
+    return pd.DataFrame(candidates).sort_values(
+        ["IOC match", "Highest AI risk", "Sensor count", "Event count"],
+        ascending=[False, False, False, False],
+    ).reset_index(drop=True)
+
+
+def create_cross_sensor_correlation_alert(correlation):
+    """Save one analyst-approved cross-sensor correlation as a review alert."""
+    indicator_type = str(correlation.get("Indicator type", "indicator"))
+    indicator = str(correlation.get("Indicator", ""))
+    sensors = [item for item in str(correlation.get("Sensors", "")).split(", ") if item]
+    if len(sensors) < 2 or not indicator:
+        return False
+    ioc_match = bool(correlation.get("IOC match", False))
+    highest_risk = int(correlation.get("Highest AI risk", 0) or 0)
+    severity = "High" if ioc_match or indicator_type == "SHA-256" or highest_risk >= 80 else "Medium"
+    title_indicator = indicator if indicator_type == "Public IP" else indicator[:16] + "…"
+    title = f"Cross-sensor {indicator_type} correlation: {title_indicator}"
+    details = "\n".join([
+        "Source: analyst-reviewed cross-sensor indicator correlation",
+        f"Indicator type: {indicator_type}",
+        f"Indicator: {indicator}",
+        f"Sensors: {', '.join(sensors)}",
+        f"Matching events: {int(correlation.get('Event count', 0) or 0)}",
+        f"Highest AI risk: {highest_risk}/100",
+        f"Threat-intelligence IOC match: {'yes' if ioc_match else 'no'}",
+        f"Event types: {correlation.get('Event types', 'Unknown')}",
+        f"First seen (UTC): {correlation.get('First seen (UTC)', 'Unknown')}",
+        f"Last seen (UTC): {correlation.get('Last seen (UTC)', 'Unknown')}",
+        "Correlation is an investigation lead; shared infrastructure or a repeated hash is not, by itself, proof of compromise.",
+    ])
+    latest = pd.to_datetime(correlation.get("Last seen (UTC)"), errors="coerce", utc=True)
+    bucket = latest.floor("h").isoformat() if pd.notna(latest) else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    digest = hashlib.sha256(f"{indicator_type}|{indicator}|{'|'.join(sensors)}|{bucket}".encode("utf-8")).hexdigest()[:32]
+    return add_alert(title, severity, details, source_event_id=f"ai-cross-sensor:{digest}")
 
 
 def promote_ai_attack_chain_alerts(chains):
