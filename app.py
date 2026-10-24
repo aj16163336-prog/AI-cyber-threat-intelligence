@@ -966,6 +966,19 @@ def init_database():
             )"""
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS incident_follow_up_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                incident_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                owner TEXT NOT NULL DEFAULT '',
+                due_at TEXT,
+                status TEXT NOT NULL DEFAULT 'Open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_incident_actions_incident ON incident_follow_up_actions(incident_id, id)")
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS response_playbook_progress (
                 alert_id INTEGER NOT NULL,
                 step_key TEXT NOT NULL,
@@ -1427,6 +1440,53 @@ def load_incident_timeline(incident_id):
             "SELECT occurred_at, event_type, actor, note FROM incident_timeline WHERE incident_id = ? ORDER BY occurred_at DESC, id DESC",
             connection, params=(int(incident_id),),
         )
+
+
+def load_incident_follow_up_actions(incident_id):
+    with connect_db() as connection:
+        return pd.read_sql_query(
+            "SELECT id, incident_id, title, owner, due_at, status, created_at, updated_at "
+            "FROM incident_follow_up_actions WHERE incident_id = ? ORDER BY "
+            "CASE status WHEN 'Blocked' THEN 0 WHEN 'Open' THEN 1 WHEN 'In Progress' THEN 2 ELSE 3 END, due_at, id",
+            connection, params=(int(incident_id),),
+        )
+
+
+def create_incident_follow_up_action(incident_id, title, owner, due_at):
+    clean_title = str(title).strip()[:240]
+    if not clean_title:
+        raise ValueError("Enter a follow-up action.")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect_db() as connection:
+        cursor = connection.execute(
+            "INSERT INTO incident_follow_up_actions (incident_id, title, owner, due_at, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'Open', ?, ?)",
+            (int(incident_id), clean_title, str(owner).strip()[:120], due_at, now, now),
+        )
+        action_id = int(cursor.lastrowid)
+    record_incident_timeline(int(incident_id), "Follow-up action added", f"Action #{action_id}: {clean_title}; owner: {str(owner).strip() or 'Unassigned'}; due: {due_at or 'No due date'}")
+    audit_event("incident_follow_up_action_created", f"incident_id={incident_id}; action_id={action_id}")
+    return action_id
+
+
+def update_incident_follow_up_action(action_id, incident_id, status):
+    allowed = {"Open", "In Progress", "Blocked", "Done"}
+    if status not in allowed:
+        raise ValueError("Invalid follow-up action status.")
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT title, status FROM incident_follow_up_actions WHERE id = ? AND incident_id = ?",
+            (int(action_id), int(incident_id)),
+        ).fetchone()
+        if not row or row[1] == status:
+            return False
+        connection.execute(
+            "UPDATE incident_follow_up_actions SET status = ?, updated_at = ? WHERE id = ? AND incident_id = ?",
+            (status, datetime.now(timezone.utc).isoformat(timespec="seconds"), int(action_id), int(incident_id)),
+        )
+    record_incident_timeline(int(incident_id), "Follow-up action status changed", f"Action #{action_id} ({row[0]}): {row[1]} → {status}")
+    audit_event("incident_follow_up_action_status_changed", f"incident_id={incident_id}; action_id={action_id}; status={status}")
+    return True
 
 
 def get_detection_settings():
@@ -2527,7 +2587,7 @@ def make_pdf(report):
     return buffer.getvalue()
 
 
-def make_incident_evidence_zip(incident, alerts, timeline):
+def make_incident_evidence_zip(incident, alerts, timeline, follow_up_actions=None):
     """Package incident metadata, linked evidence records and their timelines."""
     incident_id = int(incident.get("id"))
     alert_ids = [int(value) for value in alerts.get("id", pd.Series(dtype=int)).dropna().tolist()] if alerts is not None and not alerts.empty else []
@@ -2548,7 +2608,7 @@ def make_incident_evidence_zip(incident, alerts, timeline):
         "AI Cyber Threat Intelligence — Incident Evidence Bundle\n"
         f"Incident ID: {incident_id}\n"
         f"Generated (UTC): {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
-        "Contents: incident.json, linked_alerts.csv, incident_timeline.csv, alert_timelines.csv, ioc_matches.csv, log_findings.csv.\n"
+        "Contents: incident.json, linked_alerts.csv, incident_timeline.csv, follow_up_actions.csv, alert_timelines.csv, ioc_matches.csv, log_findings.csv.\n"
         "Original uploaded log files are not retained by the application and are not included. Log finding alert records contain the saved reason and limited excerpt.\n"
         "Indicators and automated correlations are investigation leads, not confirmed malware verdicts."
     )
@@ -2558,6 +2618,7 @@ def make_incident_evidence_zip(incident, alerts, timeline):
         bundle.writestr("incident.json", json.dumps(incident.to_dict(), ensure_ascii=False, indent=2, default=str))
         bundle.writestr("linked_alerts.csv", alerts.to_csv(index=False).encode("utf-8-sig") if alerts is not None and not alerts.empty else b"id,title,severity,status\n")
         bundle.writestr("incident_timeline.csv", timeline.to_csv(index=False).encode("utf-8-sig") if timeline is not None and not timeline.empty else b"occurred_at,event_type,actor,note\n")
+        bundle.writestr("follow_up_actions.csv", follow_up_actions.to_csv(index=False).encode("utf-8-sig") if follow_up_actions is not None and not follow_up_actions.empty else b"id,incident_id,title,owner,due_at,status,created_at,updated_at\n")
         bundle.writestr("alert_timelines.csv", alert_timeline.to_csv(index=False).encode("utf-8-sig"))
         bundle.writestr("ioc_matches.csv", ioc_matches.to_csv(index=False).encode("utf-8-sig"))
         bundle.writestr("log_findings.csv", log_findings.to_csv(index=False).encode("utf-8-sig"))
@@ -5014,6 +5075,43 @@ def render_incident_management():
         st.caption("No incident timeline activity has been recorded yet.")
     else:
         st.dataframe(timeline.rename(columns={"occurred_at":"Time (UTC)","event_type":"Activity","actor":"User","note":"Details"}), hide_index=True, width="stretch")
+    st.markdown("#### Follow-up actions")
+    st.caption("Track accountable remediation or review work for this incident. Updating actions records the change in the incident timeline.")
+    actions = load_incident_follow_up_actions(int(selected_id))
+    if not actions.empty:
+        action_display = actions.rename(columns={"id":"ID", "title":"Action", "owner":"Owner", "due_at":"Due (UTC)", "status":"Status", "updated_at":"Updated (UTC)"})
+        action_display = action_display[[column for column in ("ID", "Action", "Owner", "Due (UTC)", "Status", "Updated (UTC)") if column in action_display.columns]].copy()
+        due_dates = pd.to_datetime(action_display.get("Due (UTC)", pd.Series(index=action_display.index, dtype=str)), errors="coerce", utc=True)
+        overdue_actions = due_dates.lt(pd.Timestamp.now(tz="UTC")) & action_display["Status"].ne("Done")
+        action_display["Deadline"] = "On track / no due date"
+        action_display.loc[due_dates.notna(), "Deadline"] = "On time"
+        action_display.loc[overdue_actions, "Deadline"] = "OVERDUE"
+        st.dataframe(action_display, hide_index=True, width="stretch")
+        action_options = {f"#{int(row.id)} · {row.status} · {row.title[:90]}": int(row.id) for row in actions.itertuples(index=False)}
+        chosen_action_label = st.selectbox("Follow-up action to update", list(action_options), key=f"incident_action_choice_{selected_id}")
+        action_id = action_options[chosen_action_label]
+        action_status = st.selectbox("Action status", ["Open", "In Progress", "Blocked", "Done"], key=f"incident_action_status_{action_id}")
+        if st.button("Save follow-up action status", key=f"save_incident_action_{action_id}"):
+            changed = update_incident_follow_up_action(action_id, int(selected_id), action_status)
+            st.success("Follow-up action updated and recorded in the timeline." if changed else "Follow-up action already has that status.")
+            st.rerun()
+    else:
+        st.info("No follow-up actions have been created for this incident yet.")
+    with st.form(f"incident_action_form_{selected_id}", clear_on_submit=True):
+        action_title = st.text_input("Action", max_chars=240, placeholder="e.g. Reset affected credentials after validation")
+        action_columns = st.columns(2)
+        action_owner = action_columns[0].text_input("Owner (optional)", max_chars=120)
+        has_action_due = action_columns[1].checkbox("Set due date", key=f"incident_action_due_enabled_{selected_id}")
+        action_due_date = action_columns[1].date_input("Due date (UTC)", value=datetime.now(timezone.utc).date() + timedelta(days=1), disabled=not has_action_due, key=f"incident_action_due_{selected_id}")
+        create_action = st.form_submit_button("Add follow-up action")
+    if create_action:
+        try:
+            due_at = datetime.combine(action_due_date, datetime.max.time(), tzinfo=timezone.utc).isoformat(timespec="seconds") if has_action_due else None
+            create_incident_follow_up_action(int(selected_id), action_title, action_owner, due_at)
+            st.success("Follow-up action saved.")
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
     csv_parts = []
     summary_row = selected_incident.to_frame().T
     summary_row.insert(0, "record_type", "incident")
@@ -5026,6 +5124,10 @@ def render_incident_management():
         timeline_export = timeline.copy()
         timeline_export.insert(0, "record_type", "incident_timeline")
         csv_parts.append(timeline_export)
+    if not actions.empty:
+        actions_export = actions.copy()
+        actions_export.insert(0, "record_type", "follow_up_action")
+        csv_parts.append(actions_export)
     export_frame = pd.concat(csv_parts, ignore_index=True, sort=False)
     stem = f"incident_{int(selected_id)}_report"
     csv_bytes = export_frame.to_csv(index=False).encode("utf-8-sig")
@@ -5037,7 +5139,7 @@ def render_incident_management():
     with right:
         if st.download_button("Download incident report (PDF)", pdf_bytes, f"{stem}.pdf", "application/pdf", key=f"incident_pdf_{selected_id}"):
             audit_event("incident_report_exported", f"incident_id={selected_id}; format=pdf")
-    evidence_zip = make_incident_evidence_zip(selected_incident, linked_alerts, timeline)
+    evidence_zip = make_incident_evidence_zip(selected_incident, linked_alerts, timeline, actions)
     if st.download_button("Download incident evidence bundle (ZIP)", evidence_zip, f"incident_{int(selected_id)}_evidence.zip", "application/zip", key=f"incident_bundle_{selected_id}"):
         audit_event("incident_evidence_bundle_exported", f"incident_id={selected_id}; linked_alerts={len(linked_alerts)}")
 
