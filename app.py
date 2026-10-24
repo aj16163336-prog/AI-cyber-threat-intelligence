@@ -1741,7 +1741,24 @@ def render_ioc_watchlist():
         return
     display = items.rename(columns={"indicator_type":"Type", "indicator_value":"Indicator", "label":"Label", "created_at":"Added (UTC)", "enabled":"Enabled", "source":"Source", "expires_at":"Expires (UTC)"})
     today_utc = datetime.now(timezone.utc).date().isoformat()
+    display["Expires (UTC)"] = display["Expires (UTC)"].fillna("")
     display["Status"] = display.apply(lambda row: "Expired" if row["Expires (UTC)"] and str(row["Expires (UTC)"]) < today_utc else "Active" if row["Enabled"] else "Disabled", axis=1)
+    expiry_dates = pd.to_datetime(items["expires_at"], errors="coerce", utc=True).dt.date
+    today_date = datetime.now(timezone.utc).date()
+    active_items = items["enabled"].astype(bool) & (expiry_dates.isna() | expiry_dates.ge(today_date))
+    days_window = st.selectbox("Expiration review window", [7, 30], index=0, format_func=lambda value: f"Next {value} days", key="ioc_expiry_window")
+    expiring_items = items["enabled"].astype(bool) & expiry_dates.notna() & expiry_dates.ge(today_date) & expiry_dates.le(today_date + timedelta(days=int(days_window)))
+    expired_items = expiry_dates.notna() & expiry_dates.lt(today_date)
+    expiry_metrics = st.columns(3)
+    expiry_metrics[0].metric("Active indicators", int(active_items.sum()))
+    expiry_metrics[1].metric(f"Expiring in {days_window} days", int(expiring_items.sum()))
+    expiry_metrics[2].metric("Expired indicators", int(expired_items.sum()))
+    review_mask = expired_items | expiring_items
+    if review_mask.any():
+        review = display.loc[review_mask, ["id", "Type", "Indicator", "Label", "Source", "Expires (UTC)", "Status"]].copy()
+        review["Days remaining"] = expiry_dates.loc[review.index].map(lambda value: (value - today_date).days if pd.notna(value) else "")
+        st.subheader("Indicators needing expiry review")
+        st.dataframe(review, hide_index=True, width="stretch")
     st.dataframe(display[["id", "Type", "Indicator", "Label", "Source", "Added (UTC)", "Expires (UTC)", "Status"]], hide_index=True, width="stretch")
     options = {f"#{row.id} · {row.indicator_type} · {row.indicator_value}": int(row.id) for row in items.itertuples(index=False)}
     selected = st.selectbox("Indicator to update", list(options), key="watchlist_selected_item")
@@ -1760,6 +1777,17 @@ def render_ioc_watchlist():
                 connection.execute("DELETE FROM ioc_watchlist WHERE id = ?", (selected_id,))
             audit_event("ioc_watchlist_removed", f"id={selected_id}")
             st.rerun()
+    with st.form(f"ioc_expiry_extension_form_{selected_id}"):
+        extension_days = st.selectbox("Extend expiry by", [7, 30, 90], index=1, format_func=lambda value: f"{value} days", key=f"ioc_expiry_days_{selected_id}")
+        reenable_indicator = st.checkbox("Enable indicator after extension", value=current_enabled, key=f"ioc_expiry_enable_{selected_id}")
+        extend_expiry = st.form_submit_button("Extend indicator expiry")
+    if extend_expiry:
+        new_expiry = (datetime.now(timezone.utc).date() + timedelta(days=int(extension_days))).isoformat()
+        with connect_db() as connection:
+            connection.execute("UPDATE ioc_watchlist SET expires_at = ?, enabled = ? WHERE id = ?", (new_expiry, int(reenable_indicator), selected_id))
+        audit_event("ioc_watchlist_expiry_extended", f"id={selected_id}; days={extension_days}; enabled={reenable_indicator}")
+        st.success(f"Indicator expiry set to {new_expiry} UTC.")
+        st.rerun()
 
 
 def render_detection_tuning():
