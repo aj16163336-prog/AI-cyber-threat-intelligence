@@ -1,6 +1,6 @@
 """Authenticated API for receiving local endpoint-sensor metadata."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hmac
 import os
 from typing import Optional
@@ -8,7 +8,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, Integer, String, Text, create_engine, select
+from sqlalchemy import DateTime, Integer, String, Text, create_engine, delete, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -92,6 +92,10 @@ class SensorHeartbeatIn(BaseModel):
     pending_events: int = Field(default=0, ge=0, le=100000)
 
 
+class RetentionRequest(BaseModel):
+    days: int = Field(ge=1, le=3650)
+
+
 def require_api_token(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
@@ -160,6 +164,32 @@ def list_events(
                 for row in rows
             ]
         }
+
+
+@app.post("/v1/maintenance/events/retention-preview")
+def preview_event_retention(
+    request: RetentionRequest,
+    _token: None = Depends(require_api_token),
+):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=request.days)).isoformat(timespec="seconds")
+    with SessionLocal() as session:
+        eligible = session.scalar(
+            select(func.count()).select_from(EndpointEvent).where(EndpointEvent.occurred_at < cutoff)
+        )
+    return {"days": request.days, "cutoff_utc": cutoff, "eligible_events": int(eligible or 0)}
+
+
+@app.post("/v1/maintenance/events/retention")
+def apply_event_retention(
+    request: RetentionRequest,
+    _token: None = Depends(require_api_token),
+):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=request.days)).isoformat(timespec="seconds")
+    with SessionLocal() as session:
+        result = session.execute(delete(EndpointEvent).where(EndpointEvent.occurred_at < cutoff))
+        deleted = max(int(result.rowcount or 0), 0)
+        session.commit()
+    return {"days": request.days, "cutoff_utc": cutoff, "deleted_events": deleted}
 
 
 @app.post("/v1/sensors/heartbeat")

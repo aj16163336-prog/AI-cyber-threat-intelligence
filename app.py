@@ -15,6 +15,7 @@ import sqlite3
 import tomllib
 import socket
 import ssl
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -848,6 +849,61 @@ def init_database():
             )"""
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS saved_hunt_queries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                query_text TEXT NOT NULL DEFAULT '',
+                filters_json TEXT NOT NULL DEFAULT '{}',
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS investigation_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'Medium',
+                status TEXT NOT NULL DEFAULT 'Open',
+                owner TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS investigation_case_alerts (
+                case_id INTEGER NOT NULL,
+                alert_id INTEGER NOT NULL,
+                linked_at TEXT NOT NULL,
+                PRIMARY KEY (case_id, alert_id)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS investigation_case_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS safe_test_events (
+                event_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                scenario TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                risk_score INTEGER NOT NULL,
+                alert_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'Active'
+            )"""
+        )
+        test_event_columns = {row[1] for row in connection.execute("PRAGMA table_info(safe_test_events)")}
+        if "status" not in test_event_columns:
+            connection.execute("ALTER TABLE safe_test_events ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS ioc_watchlist (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 indicator_type TEXT NOT NULL,
@@ -997,6 +1053,118 @@ def read_app_state(key, default=""):
     with connect_db() as connection:
         row = connection.execute("SELECT value FROM app_state WHERE key = ?", (str(key),)).fetchone()
     return row[0] if row else default
+
+
+def alert_group_window_minutes():
+    try:
+        return max(1, min(1440, int(read_app_state("alert_group_window_minutes", "15"))))
+    except (TypeError, ValueError):
+        return 15
+
+
+def load_saved_hunt_queries():
+    with connect_db() as connection:
+        return pd.read_sql_query(
+            "SELECT id, name, query_text, filters_json, created_by, created_at, updated_at "
+            "FROM saved_hunt_queries ORDER BY name COLLATE NOCASE",
+            connection,
+        )
+
+
+def save_hunt_query(name, query_text, filters):
+    clean_name = str(name).strip()[:100]
+    if not clean_name:
+        raise ValueError("Enter a name for this saved search.")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    encoded = json.dumps(filters, ensure_ascii=True, separators=(",", ":"))
+    with connect_db() as connection:
+        connection.execute(
+            """INSERT INTO saved_hunt_queries (name, query_text, filters_json, created_by, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET query_text=excluded.query_text,
+                 filters_json=excluded.filters_json, created_by=excluded.created_by, updated_at=excluded.updated_at""",
+            (clean_name, str(query_text).strip()[:300], encoded,
+             str(st.session_state.get("username", "Analyst"))[:120], now, now),
+        )
+    audit_event("threat_hunt_query_saved", f"name={clean_name[:100]}")
+
+
+def load_retention_counts(days):
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat(timespec="seconds")
+    counts = {}
+    with connect_db() as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        queries = {
+            "Closed / resolved alerts": ("alerts", "created_at < ? AND status IN ('Closed','Resolved')"),
+            "Local endpoint events": ("endpoint_events", "created_at < ?"),
+            "AI baseline observations": ("ai_baseline_events", "occurred_at < ?"),
+            "AI analyst feedback": ("ai_analyst_feedback", "updated_at < ?"),
+            "Audit records": ("audit_log", "occurred_at < ?"),
+            "Old AI reviews": ("ai_live_reviews", "requested_at < ?"),
+            "Suppression match history": ("suppression_matches", "first_seen_at < ?"),
+            "Synthetic test records": ("safe_test_events", "created_at < ?"),
+        }
+        for label, (table, condition) in queries.items():
+            if table in tables:
+                if table == "endpoint_events":
+                    columns = {row[1] for row in connection.execute("PRAGMA table_info(endpoint_events)")}
+                    if "synced" in columns:
+                        condition = "created_at < ? AND COALESCE(synced, 0) = 1"
+                counts[label] = int(connection.execute(f"SELECT COUNT(*) FROM {table} WHERE {condition}", (cutoff,)).fetchone()[0])
+    return cutoff, counts
+
+
+def purge_local_retention_records(days):
+    cutoff, preview = load_retention_counts(days)
+    removed = {}
+    with connect_db() as connection:
+        connection.execute("BEGIN")
+        expired_alert_ids = [row[0] for row in connection.execute(
+            "SELECT id FROM alerts WHERE created_at < ? AND status IN ('Closed','Resolved')", (cutoff,)
+        ).fetchall()]
+        if expired_alert_ids:
+            marks = ",".join("?" for _ in expired_alert_ids)
+            for table in ("alert_timeline", "alert_checklist", "response_playbook_progress", "incident_alert_links", "investigation_case_alerts"):
+                connection.execute(f"DELETE FROM {table} WHERE alert_id IN ({marks})", expired_alert_ids)
+            connection.execute(f"DELETE FROM alerts WHERE id IN ({marks})", expired_alert_ids)
+        removed["Closed / resolved alerts"] = len(expired_alert_ids)
+        all_tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        cleanup = {
+            "Local endpoint events": ("endpoint_events", "created_at"),
+            "AI baseline observations": ("ai_baseline_events", "occurred_at"),
+            "AI analyst feedback": ("ai_analyst_feedback", "updated_at"),
+            "Audit records": ("audit_log", "occurred_at"),
+            "Old AI reviews": ("ai_live_reviews", "requested_at"),
+            "Suppression match history": ("suppression_matches", "first_seen_at"),
+            "Synthetic test records": ("safe_test_events", "created_at"),
+        }
+        for label, (table, time_column) in cleanup.items():
+            if table in all_tables:
+                condition = f"{time_column} < ?"
+                if table == "endpoint_events":
+                    columns = {row[1] for row in connection.execute("PRAGMA table_info(endpoint_events)")}
+                    if "synced" in columns:
+                        condition += " AND COALESCE(synced, 0) = 1"
+                cursor = connection.execute(f"DELETE FROM {table} WHERE {condition}", (cutoff,))
+                removed[label] = max(int(cursor.rowcount), 0)
+        connection.commit()
+    return removed
+
+
+def call_api_retention(days, *, apply=False):
+    api_url = setting("API_BASE_URL").strip().rstrip("/")
+    token = setting("API_TOKEN").strip()
+    if not api_url or not token:
+        raise ValueError("Cloud event retention needs API_BASE_URL and API_TOKEN in the app's private settings.")
+    route = "/v1/maintenance/events/retention" if apply else "/v1/maintenance/events/retention-preview"
+    response = requests.post(
+        f"{api_url}{route}",
+        json={"days": int(days)},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def load_alerts():
@@ -1528,7 +1696,7 @@ def add_alert(title, severity, details, mitre_id="", source_event_id=None):
         if source_event_id:
             if connection.execute("SELECT 1 FROM alerts WHERE source_event_id = ?", (source_event_id,)).fetchone():
                 return False
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=alert_group_window_minutes())).isoformat(timespec="seconds")
         grouped_alert = connection.execute(
             "SELECT id, occurrence_count FROM alerts WHERE dedupe_key = ? AND status IN ('Open', 'Acknowledged') AND last_seen_at >= ? ORDER BY id DESC LIMIT 1",
             (dedupe_key, cutoff),
@@ -3951,7 +4119,7 @@ def render_alert_system():
     active_count = int(alerts["status"].isin(["Open", "Acknowledged"]).sum())
     if "occurrence_count" in alerts.columns:
         grouped_observations = int(pd.to_numeric(alerts["occurrence_count"], errors="coerce").fillna(1).sum())
-        st.caption(f"{len(alerts)} alert group(s) represent {grouped_observations} observed signal(s). Matching open alerts are grouped for 15 minutes.")
+        st.caption(f"{len(alerts)} alert group(s) represent {grouped_observations} observed signal(s). Matching open alerts are grouped for {alert_group_window_minutes()} minute(s).")
     if is_admin() and st.button("Clear all notifications", disabled=active_count == 0, type="secondary"):
         cleared_count = clear_all_notifications()
         st.session_state["notifications_cleared_message"] = (
@@ -4328,7 +4496,24 @@ def render_threat_hunting():
         data["risk_score"] = 0
     data["risk_score"] = pd.to_numeric(data["risk_score"], errors="coerce").fillna(0).clip(0, 100)
     time_column = next((column for column in ("occurred_at", "created_at") if column in data.columns), None)
-    lookback_hours = st.select_slider("Look back", options=[1, 6, 12, 24, 48, 72, 168], value=24, format_func=lambda value: f"{value} hour(s)")
+    saved_queries = load_saved_hunt_queries()
+    saved_query_names = saved_queries["name"].astype(str).tolist() if not saved_queries.empty else []
+    selected_saved_query = st.selectbox("Saved search", ["Current filters", *saved_query_names], key="hunt_saved_selection")
+    if selected_saved_query != "Current filters":
+        saved_row = saved_queries.loc[saved_queries["name"].eq(selected_saved_query)].iloc[0]
+        if st.session_state.get("_loaded_hunt_query") != int(saved_row["id"]):
+            try:
+                saved_filters = json.loads(str(saved_row["filters_json"] or "{}"))
+            except (TypeError, ValueError):
+                saved_filters = {}
+            st.session_state["hunt_query"] = str(saved_row["query_text"] or "")
+            st.session_state["hunt_lookback"] = int(saved_filters.get("lookback_hours", 24))
+            st.session_state["hunt_min_risk"] = int(saved_filters.get("min_risk", 0))
+            st.session_state["hunt_types"] = list(saved_filters.get("event_types", []))
+            st.session_state["hunt_severity"] = list(saved_filters.get("severities", []))
+            st.session_state["_loaded_hunt_query"] = int(saved_row["id"])
+            st.rerun()
+    lookback_hours = st.select_slider("Look back", options=[1, 6, 12, 24, 48, 72, 168], value=24, format_func=lambda value: f"{value} hour(s)", key="hunt_lookback")
     if time_column:
         parsed = pd.to_datetime(data[time_column], errors="coerce", utc=True)
         cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=lookback_hours)
@@ -4337,6 +4522,9 @@ def render_threat_hunting():
     columns = st.columns(3)
     types = sorted(data.get("event_type", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     severities = sorted(data.get("severity", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    if selected_saved_query != "Current filters":
+        st.session_state["hunt_types"] = [value for value in st.session_state.get("hunt_types", []) if value in types]
+        st.session_state["hunt_severity"] = [value for value in st.session_state.get("hunt_severity", []) if value in severities]
     with columns[0]:
         chosen_types = st.multiselect("Event type", types, default=types, key="hunt_types")
     with columns[1]:
@@ -4344,6 +4532,22 @@ def render_threat_hunting():
     with columns[2]:
         min_risk = st.slider("Minimum risk score", 0, 100, 0, 5, key="hunt_min_risk")
     query = st.text_input("Search event text, process, IP, or file name", key="hunt_query").strip().casefold()
+    with st.expander("Save current hunting filters"):
+        with st.form("save_threat_hunt_query_form"):
+            query_name = st.text_input("Search name", max_chars=100, placeholder="e.g. High-risk PowerShell activity")
+            save_query_clicked = st.form_submit_button("Save search")
+        if save_query_clicked:
+            try:
+                save_hunt_query(query_name, query, {
+                    "event_types": chosen_types,
+                    "severities": chosen_severity,
+                    "min_risk": int(min_risk),
+                    "lookback_hours": int(lookback_hours),
+                })
+                st.success("Saved search is available from the Saved search selector.")
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
     if "event_type" in data:
         data = data[data["event_type"].astype(str).isin(chosen_types)]
     if "severity" in data:
@@ -4493,6 +4697,295 @@ def render_event_correlation_graph():
     visible_columns = [column for column in ("occurred_at", "created_at", "sensor_id", "event_type", "severity", "risk_score", "summary", "process_name", "remote_ip", "file_name", "file_sha256") if column in related]
     st.dataframe(related[visible_columns], hide_index=True, width="stretch")
     st.download_button("Download related events (CSV)", related.to_csv(index=False).encode("utf-8-sig"), "event_correlation.csv", "text/csv")
+
+
+def render_alert_noise_control():
+    st.subheader("Alert Noise Control")
+    st.write("Group repeat alerts over a configurable time window and review where duplicate signals are coming from.")
+    alerts = load_alerts()
+    active = alerts[alerts["status"].isin(["Open", "Acknowledged"])] if not alerts.empty else alerts
+    grouped = pd.to_numeric(active.get("occurrence_count", pd.Series(dtype=int)), errors="coerce").fillna(1)
+    repeat_count = int((grouped - 1).clip(lower=0).sum())
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("Active alert groups", len(active))
+    metric_columns[1].metric("Repeated signals grouped", repeat_count)
+    metric_columns[2].metric("Active suppression rules", len(load_suppression_rules(active_only=True)))
+    current_window = alert_group_window_minutes()
+    new_window = st.slider("Group matching open alerts for", 1, 1440, current_window, 1, format="%d min", key="alert_group_window_control")
+    st.caption("Matching title and severity alerts are grouped during this window. Suppression rules remain exact-match and keep collecting events.")
+    if is_admin() and st.button("Save alert grouping window", key="save_alert_group_window"):
+        save_app_state("alert_group_window_minutes", str(int(new_window)))
+        audit_event("alert_group_window_updated", f"minutes={int(new_window)}")
+        st.success("Alert grouping window saved.")
+        st.rerun()
+    if not active.empty:
+        repeated = active.copy()
+        repeated["occurrence_count"] = pd.to_numeric(repeated["occurrence_count"], errors="coerce").fillna(1)
+        st.markdown("#### Most repeated active signals")
+        st.dataframe(
+            repeated.sort_values(["occurrence_count", "last_seen_at"], ascending=[False, False])
+            [[column for column in ("title", "severity", "status", "occurrence_count", "created_at", "last_seen_at") if column in repeated.columns]]
+            .head(20), hide_index=True, width="stretch",
+        )
+    else:
+        st.info("No active alerts are available to summarize yet.")
+
+
+def render_saved_hunt_queries_panel():
+    st.subheader("Saved Threat Hunting Queries")
+    st.write("Save searches in Threat Hunting and reuse the same text, time window, event types, severity, and risk threshold.")
+    saved = load_saved_hunt_queries()
+    if saved.empty:
+        st.info("No saved searches yet. Open Threat Hunting, set filters, then use **Save current hunting filters**.")
+        return
+    display = saved[["name", "query_text", "filters_json", "created_by", "updated_at"]].copy()
+    display = display.rename(columns={"name":"Search", "query_text":"Text filter", "filters_json":"Saved filters", "created_by":"Saved by", "updated_at":"Updated (UTC)"})
+    st.dataframe(display, hide_index=True, width="stretch")
+    if is_admin():
+        selected_name = st.selectbox("Saved search to remove", saved["name"].astype(str).tolist(), key="saved_query_delete_choice")
+        confirm = st.checkbox("I understand this removes only the saved search, not event data.", key="confirm_saved_query_delete")
+        if st.button("Delete saved search", disabled=not confirm, key="delete_saved_hunt_query"):
+            with connect_db() as connection:
+                connection.execute("DELETE FROM saved_hunt_queries WHERE name = ?", (selected_name,))
+            audit_event("threat_hunt_query_deleted", f"name={selected_name[:100]}")
+            st.success("Saved search deleted.")
+            st.rerun()
+
+
+def render_sensor_diagnostics():
+    st.subheader("Sensor Diagnostics")
+    st.write("Check the endpoint sensor, local event store, watched folders, and cloud API connection.")
+    try:
+        events, source = load_sensor_events(limit=500)
+        report = sensor_health_report(events, source)
+    except Exception as error:
+        events, source, report = pd.DataFrame(), "unavailable", {"status":"Error", "last_heartbeat":"Unknown", "last_event":"Unknown", "cloud_sync":"Unknown", "pending":"Unknown", "explanation":str(error)[:300]}
+    columns = st.columns(4)
+    columns[0].metric("Sensor", report.get("status", "Unknown"))
+    columns[1].metric("Last heartbeat", report.get("last_heartbeat", "Unknown"))
+    columns[2].metric("Last event", report.get("last_event", "Unknown"))
+    columns[3].metric("Cloud sync queue", report.get("pending", "Unknown"))
+    st.caption(report.get("explanation", "No diagnostic details."))
+
+    checks = []
+    try:
+        with connect_db() as connection:
+            integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+            connection.execute("SAVEPOINT cti_diagnostics_write")
+            probe_key = "diagnostic_probe_" + uuid.uuid4().hex
+            connection.execute("INSERT INTO app_state (key,value) VALUES (?, 'ok')", (probe_key,))
+            connection.execute("ROLLBACK TO cti_diagnostics_write")
+            connection.execute("RELEASE cti_diagnostics_write")
+        checks.append({"Check":"Application database", "Result":"Healthy" if integrity == "ok" else "Needs review", "Details":str(integrity)})
+    except sqlite3.Error as error:
+        checks.append({"Check":"Application database", "Result":"Error", "Details":str(error)[:240]})
+
+    if source == "local" and os.name == "nt":
+        watched_roots = [Path.home() / name for name in ("Downloads", "Desktop", "Documents")]
+        checks.extend({"Check":f"Watch folder · {folder.name}", "Result":"Available" if folder.is_dir() else "Not found", "Details":str(folder)} for folder in watched_roots)
+    else:
+        checks.append({"Check":"Laptop folder access", "Result":"Not available here", "Details":"A hosted dashboard cannot inspect folders on the laptop."})
+
+    api_url = setting("API_BASE_URL").strip().rstrip("/")
+    if api_url:
+        try:
+            response = requests.get(f"{api_url}/health", timeout=8)
+            response.raise_for_status()
+            checks.append({"Check":"Endpoint API", "Result":"Connected", "Details":str(response.json().get("service", "API is healthy"))})
+        except (requests.RequestException, ValueError) as error:
+            checks.append({"Check":"Endpoint API", "Result":"Unavailable", "Details":f"{type(error).__name__}: {str(error)[:200]}"})
+    else:
+        checks.append({"Check":"Endpoint API", "Result":"Not configured", "Details":"Events are local-only until API settings are configured."})
+    st.dataframe(pd.DataFrame(checks), hide_index=True, width="stretch")
+    if st.button("Refresh diagnostics", key="refresh_sensor_diagnostics"):
+        load_sensor_events.clear()
+        load_cloud_sensor_heartbeats.clear()
+        st.rerun()
+
+
+def render_case_notes():
+    st.subheader("Investigation Case Notes")
+    st.write("Create a case, link related alerts, assign an owner, and keep analyst notes in a timestamped timeline.")
+    alerts = load_alerts()
+    alert_choices = {}
+    if not alerts.empty:
+        alert_choices = {f"#{int(row.id)} · {row.severity} · {str(row.title)[:90]}": int(row.id) for row in alerts.itertuples()}
+    with st.form("investigation_case_create_form"):
+        title = st.text_input("Case title", max_chars=180)
+        left, right = st.columns(2)
+        with left:
+            severity = st.selectbox("Case severity", ["Low", "Medium", "High", "Critical"], index=1)
+        with right:
+            owner = st.text_input("Assigned analyst", max_chars=120)
+        summary = st.text_area("Initial case summary", max_chars=3000)
+        linked_alerts = st.multiselect("Link alerts", list(alert_choices))
+        create_case = st.form_submit_button("Create investigation case", type="primary")
+    if create_case:
+        if not title.strip():
+            st.error("Enter a case title.")
+        else:
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            with connect_db() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO investigation_cases (title,severity,owner,summary,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                    (title.strip(), severity, owner.strip(), summary.strip(), str(st.session_state.get("username", "Analyst"))[:120], now, now),
+                )
+                case_id = int(cursor.lastrowid)
+                connection.executemany(
+                    "INSERT OR IGNORE INTO investigation_case_alerts (case_id,alert_id,linked_at) VALUES (?,?,?)",
+                    [(case_id, alert_choices[label], now) for label in linked_alerts],
+                )
+            audit_event("investigation_case_created", f"case_id={case_id}; title={title.strip()[:120]}")
+            st.success(f"Case #{case_id} created.")
+            st.rerun()
+
+    with connect_db() as connection:
+        cases = pd.read_sql_query("SELECT * FROM investigation_cases ORDER BY updated_at DESC, id DESC", connection)
+    if cases.empty:
+        st.info("No investigation cases have been created yet.")
+        return
+    st.dataframe(cases[["id","title","severity","status","owner","created_at","updated_at"]], hide_index=True, width="stretch")
+    labels = {f"#{int(row.id)} · {row.status} · {str(row.title)[:100]}":int(row.id) for row in cases.itertuples()}
+    selected_label = st.selectbox("Case to review", list(labels), key="case_notes_selection")
+    case_id = labels[selected_label]
+    current_case = cases.loc[cases["id"].eq(case_id)].iloc[0]
+    with st.form(f"case_update_form_{case_id}"):
+        status = st.selectbox("Case status", ["Open", "Investigating", "Contained", "Resolved", "Closed"], index=["Open", "Investigating", "Contained", "Resolved", "Closed"].index(current_case["status"]) if current_case["status"] in ["Open", "Investigating", "Contained", "Resolved", "Closed"] else 0)
+        new_owner = st.text_input("Case owner", value=str(current_case["owner"] or ""), max_chars=120)
+        note = st.text_area("Add case note", max_chars=4000, placeholder="Evidence checked, decisions, and next steps")
+        save_case_update = st.form_submit_button("Save case update")
+    if save_case_update:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with connect_db() as connection:
+            connection.execute("UPDATE investigation_cases SET status=?,owner=?,updated_at=? WHERE id=?", (status,new_owner.strip(),now,case_id))
+            if note.strip():
+                connection.execute("INSERT INTO investigation_case_notes (case_id,created_at,created_by,note) VALUES (?,?,?,?)", (case_id,now,str(st.session_state.get("username","Analyst"))[:120],note.strip()))
+        audit_event("investigation_case_updated", f"case_id={case_id}; status={status}; note_added={bool(note.strip())}")
+        st.success("Case update saved.")
+        st.rerun()
+    with connect_db() as connection:
+        linked = pd.read_sql_query(
+            "SELECT a.id,a.severity,a.status,a.title,a.created_at FROM alerts a JOIN investigation_case_alerts l ON l.alert_id=a.id WHERE l.case_id=? ORDER BY a.id DESC",
+            connection, params=(case_id,),
+        )
+        notes = pd.read_sql_query("SELECT created_at,created_by,note FROM investigation_case_notes WHERE case_id=? ORDER BY id DESC", connection, params=(case_id,))
+    st.markdown("#### Linked alerts")
+    st.dataframe(linked, hide_index=True, width="stretch") if not linked.empty else st.caption("No alerts are linked to this case.")
+    st.markdown("#### Case timeline")
+    st.dataframe(notes.rename(columns={"created_at":"Time (UTC)","created_by":"Analyst","note":"Note"}), hide_index=True, width="stretch") if not notes.empty else st.caption("No case notes have been added yet.")
+
+
+def render_safe_test_generator():
+    st.subheader("Safe Test-Event Generator")
+    st.write("Create clearly marked synthetic alerts to verify the alert inbox and investigation flow. Nothing is uploaded, emailed, or run on the endpoint.")
+    scenarios = {
+        "Repeated suspicious process": ("High", 82, "Synthetic process metadata suggests repeated execution from a user-writable path."),
+        "Unusual outbound connection": ("Medium", 68, "Synthetic outbound connection metadata is included for alert workflow validation."),
+        "After-hours sign-in pattern": ("High", 76, "Synthetic repeated sign-in metadata is included for alert workflow validation."),
+    }
+    scenario = st.selectbox("Test scenario", list(scenarios), key="safe_test_scenario")
+    if is_admin() and st.button("Generate safe test alert", type="primary", key="generate_safe_test_event"):
+        severity, score, reason = scenarios[scenario]
+        event_id = "test-" + uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        title = f"[TEST] {scenario}"
+        details = f"SAFE SYNTHETIC TEST EVENT — not real endpoint activity.\nScenario: {scenario}\nRisk score: {score}/100\nReason: {reason}\nNo endpoint files, processes, or network connections were accessed. No email or cloud event upload was performed."
+        with connect_db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO alerts (created_at,title,severity,details,source_event_id,status,occurrence_count,last_seen_at,dedupe_key) VALUES (?,?,?,?,?,'Open',1,?,?)",
+                (now,title,severity,details,f"safe-test:{event_id}",now,alert_fingerprint(title,severity)),
+            )
+            alert_id = int(cursor.lastrowid)
+            connection.execute("INSERT INTO safe_test_events (event_id,created_at,scenario,severity,risk_score,alert_id,status) VALUES (?,?,?,?,?,?,'Active')", (event_id,now,scenario,severity,score,alert_id))
+        record_alert_timeline(alert_id,"Safe test alert created",details)
+        audit_event("safe_test_event_generated", f"event_id={event_id}; scenario={scenario}; alert_id={alert_id}")
+        st.success(f"Synthetic alert #{alert_id} created. Find it in Alert System; it is labeled [TEST].")
+    elif not is_admin():
+        st.info("Admin access is required to generate synthetic alerts.")
+    with connect_db() as connection:
+        generated = pd.read_sql_query("SELECT event_id,created_at,scenario,severity,risk_score,alert_id,status FROM safe_test_events ORDER BY created_at DESC", connection)
+    if not generated.empty:
+        st.dataframe(generated, hide_index=True, width="stretch")
+        if is_admin():
+            if st.button("Close all active test alerts", key="close_safe_test_alerts"):
+                active_ids = generated.loc[generated["status"].eq("Active"), "alert_id"].dropna().astype(int).tolist()
+                with connect_db() as connection:
+                    connection.execute("UPDATE safe_test_events SET status='Closed' WHERE status='Active'")
+                    if active_ids:
+                        marks = ",".join("?" for _ in active_ids)
+                        connection.execute(f"UPDATE alerts SET status='Closed' WHERE id IN ({marks})", active_ids)
+                for alert_id in active_ids:
+                    record_alert_timeline(alert_id,"Safe test closed","Synthetic test alert closed by the test-event generator.")
+                audit_event("safe_test_alerts_closed", f"count={len(active_ids)}")
+                st.success(f"Closed {len(active_ids)} synthetic test alert(s).")
+                st.rerun()
+
+
+def render_data_retention_controls():
+    st.subheader("Data Retention Controls")
+    st.write("Preview and remove records older than the selected period. Open alerts, active incidents, saved searches, case notes, and configuration are preserved.")
+    if not is_admin():
+        st.info("Admin access is required to change retention or purge old records.")
+        return
+    days = st.selectbox("Retain records for", [7, 14, 30, 60, 90, 180, 365], index=2, format_func=lambda value:f"{value} days", key="retention_days")
+    cutoff, local_counts = load_retention_counts(days)
+    st.caption(f"Cutoff: before {cutoff} (UTC). Local application database preview:")
+    st.dataframe(pd.DataFrame([{"Record type":name,"Older records":count} for name,count in local_counts.items()]), hide_index=True, width="stretch")
+    api_url = setting("API_BASE_URL").strip().rstrip("/")
+    api_preview = None
+    if api_url and setting("API_TOKEN"):
+        if st.button("Preview cloud sensor-event retention", key="preview_cloud_retention"):
+            try:
+                api_preview = call_api_retention(days)
+                st.session_state["cloud_retention_preview"] = api_preview
+            except requests.RequestException as error:
+                st.error(f"Cloud retention preview could not reach the API: {type(error).__name__}.")
+        api_preview = st.session_state.get("cloud_retention_preview")
+        if api_preview:
+            if int(api_preview.get("days", -1)) == int(days):
+                st.metric("Older cloud sensor events", int(api_preview.get("eligible_events", 0)))
+            else:
+                st.warning("The retention period changed. Preview cloud events again before applying this period.")
+    else:
+        st.info("Cloud event retention is unavailable until the authenticated endpoint API is configured.")
+    st.warning("Purging is permanent. Review the preview first; only closed/resolved alerts and old telemetry/history are eligible.")
+    confirmed = st.checkbox("I reviewed the counts and want to permanently purge records older than this period.", key="confirm_data_retention_purge")
+    cloud_preview_ready = not (api_url and setting("API_TOKEN")) or (
+        bool(st.session_state.get("cloud_retention_preview"))
+        and int(st.session_state["cloud_retention_preview"].get("days", -1)) == int(days)
+    )
+    if st.button("Apply retention now", disabled=not confirmed or not cloud_preview_ready, type="secondary", key="apply_data_retention"):
+        try:
+            cloud_removed = None
+            if api_url and setting("API_TOKEN"):
+                cloud_removed = call_api_retention(days, apply=True)
+            local_removed = purge_local_retention_records(days)
+            audit_event("data_retention_applied", f"days={days}; local={json.dumps(local_removed,sort_keys=True)}; cloud={json.dumps(cloud_removed,sort_keys=True) if cloud_removed else 'not configured'}")
+            st.success(f"Retention complete. Local records removed: {sum(local_removed.values())}. Cloud sensor events removed: {int((cloud_removed or {}).get('deleted_events',0))}.")
+            st.session_state.pop("cloud_retention_preview", None)
+            st.rerun()
+        except requests.RequestException as error:
+            st.error(f"Cloud retention failed before local cleanup. API response: {type(error).__name__}.")
+        except (sqlite3.Error, ValueError) as error:
+            st.error(f"Retention could not complete: {str(error)[:300]}")
+
+
+def render_security_operations_toolkit():
+    render_page_heading("Security Operations Toolkit")
+    st.write("Six practical tools for reducing alert noise, reusing hunts, diagnosing the sensor, tracking cases, validating workflows, and managing data retention.")
+    tabs = st.tabs(["Alert Noise Control", "Saved Hunt Queries", "Sensor Diagnostics", "Case Notes", "Safe Test Events", "Data Retention"])
+    with tabs[0]:
+        render_alert_noise_control()
+    with tabs[1]:
+        render_saved_hunt_queries_panel()
+    with tabs[2]:
+        render_sensor_diagnostics()
+    with tabs[3]:
+        render_case_notes()
+    with tabs[4]:
+        render_safe_test_generator()
+    with tabs[5]:
+        render_data_retention_controls()
 
 
 def render_network_connection_map():
@@ -5300,6 +5793,7 @@ def main():
         "AI Model Evaluation Lab",
         "MITRE ATT&CK Map",
         "Alert System",
+        "Security Operations Toolkit",
         "Incident Management",
         "Report Generator",
         "Log Analyzer",
@@ -5332,6 +5826,7 @@ def main():
         "AI Model Evaluation Lab": "◫",
         "MITRE ATT&CK Map": "⌘",
         "Alert System": "⚑",
+        "Security Operations Toolkit": "⚒",
         "Incident Management": "▣",
         "Report Generator": "▤",
         "Log Analyzer": "⌁",
@@ -5380,6 +5875,8 @@ def main():
         render_mitre_map()
     elif page == "Alert System":
         render_alert_system()
+    elif page == "Security Operations Toolkit":
+        render_security_operations_toolkit()
     elif page == "Incident Management":
         render_incident_management()
     elif page == "Report Generator":
