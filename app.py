@@ -864,6 +864,16 @@ def init_database():
             )"""
         )
         connection.execute(
+            """CREATE TABLE IF NOT EXISTS investigation_checklist_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                steps_json TEXT NOT NULL,
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
             """CREATE TABLE IF NOT EXISTS incidents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -990,6 +1000,19 @@ def init_database():
                 updated_at TEXT NOT NULL
             )"""
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS sensor_maintenance_windows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_sensor_maintenance_scope_time ON sensor_maintenance_windows(scope, start_at, end_at, enabled)")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS response_playbook_progress (
                 alert_id INTEGER NOT NULL,
@@ -1705,6 +1728,49 @@ def sync_watchlist_alerts(events):
     return created
 
 
+def render_ioc_match_context(watchlist_id):
+    st.markdown("#### Match history and context")
+    matching_alerts = load_alerts()
+    source_prefix = f"watchlist:{int(watchlist_id)}:"
+    if matching_alerts.empty or "source_event_id" not in matching_alerts:
+        st.info("No saved watchlist match alerts are available for this indicator yet.")
+        return
+    matching_alerts = matching_alerts[matching_alerts["source_event_id"].fillna("").astype(str).str.startswith(source_prefix)].copy()
+    if matching_alerts.empty:
+        st.info("No endpoint events have matched this indicator yet.")
+        return
+    try:
+        events, _source = load_sensor_events(limit=5000)
+    except Exception:
+        events = pd.DataFrame()
+    event_id_col = next((column for column in ("event_id", "event_uid", "id") if column in events.columns), None)
+    context_rows = []
+    for alert in matching_alerts.to_dict("records"):
+        event_id = alert_source_event_id(alert.get("source_event_id"))
+        row = {
+            "Alert ID": alert.get("id"),
+            "Matched (UTC)": alert.get("created_at", "Unknown"),
+            "Severity": alert.get("severity", "Unknown"),
+            "Status": alert.get("status", "Unknown"),
+            "Alert": alert.get("title", ""),
+        }
+        if event_id_col and event_id:
+            event = events.loc[events[event_id_col].fillna("").astype(str).eq(event_id)]
+            if not event.empty:
+                details = event.iloc[0]
+                row.update({
+                    "Event type": details.get("event_type", "Unknown"),
+                    "Sensor": str(details.get("sensor_id") or "Local sensor")[:16],
+                    "Process": details.get("process_name", ""),
+                    "Remote IP": details.get("remote_ip", ""),
+                    "File": details.get("file_name", ""),
+                    "Event summary": str(details.get("summary") or "")[:180],
+                })
+        context_rows.append(row)
+    st.caption(f"{len(context_rows)} matching alert record(s). Event details are shown when the originating event remains in the recent 5,000-record sample.")
+    st.dataframe(pd.DataFrame(context_rows), hide_index=True, width="stretch")
+
+
 def render_ioc_watchlist():
     render_page_heading("IOC Watchlist")
     if not require_admin():
@@ -1762,9 +1828,10 @@ def render_ioc_watchlist():
     st.dataframe(display[["id", "Type", "Indicator", "Label", "Source", "Added (UTC)", "Expires (UTC)", "Status"]], hide_index=True, width="stretch")
     options = {f"#{row.id} · {row.indicator_type} · {row.indicator_value}": int(row.id) for row in items.itertuples(index=False)}
     selected = st.selectbox("Indicator to update", list(options), key="watchlist_selected_item")
-    left, right = st.columns(2)
     selected_id = options[selected]
     current_enabled = bool(items.loc[items["id"] == selected_id, "enabled"].iloc[0])
+    render_ioc_match_context(selected_id)
+    left, right = st.columns(2)
     with left:
         if st.button("Disable indicator" if current_enabled else "Enable indicator", key="watchlist_toggle"):
             with connect_db() as connection:
@@ -2009,6 +2076,76 @@ def save_alert_checklist(alert_id, checked_items):
         "Checklist updated",
         f"Investigation checklist saved: {completed}/{len(checked_items)} steps complete.",
     )
+
+
+def load_investigation_checklist_templates():
+    with connect_db() as connection:
+        return pd.read_sql_query("SELECT id, name, steps_json, created_by, updated_at FROM investigation_checklist_templates ORDER BY name COLLATE NOCASE", connection)
+
+
+def render_investigation_checklist_templates(alert_id):
+    st.markdown("#### Reusable checklist templates")
+    st.caption("Create a reusable set of analyst steps, then apply it to any alert. Applying a template adds checklist steps and keeps existing progress.")
+    with st.expander("Create a checklist template"):
+        with st.form("investigation_checklist_template_create_form", clear_on_submit=True):
+            template_name = st.text_input("Template name", max_chars=100)
+            template_steps_text = st.text_area("Steps (one per line)", max_chars=4000, placeholder="Confirm affected host and time\nReview related process and network events\nDocument the analyst decision")
+            create_template = st.form_submit_button("Save checklist template")
+        if create_template:
+            steps = [line.strip()[:300] for line in template_steps_text.splitlines() if line.strip()]
+            if not template_name.strip():
+                st.error("Enter a name for this template.")
+            elif not steps or len(steps) > 20:
+                st.error("Add between 1 and 20 checklist steps.")
+            else:
+                now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                try:
+                    with connect_db() as connection:
+                        connection.execute(
+                            "INSERT INTO investigation_checklist_templates (name, steps_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                            (template_name.strip()[:100], json.dumps(steps, ensure_ascii=True), str(st.session_state.get("username", "Analyst"))[:120], now, now),
+                        )
+                    audit_event("investigation_checklist_template_created", f"name={template_name.strip()[:100]}; steps={len(steps)}")
+                    st.success("Checklist template saved.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("A checklist template with that name already exists.")
+    templates = load_investigation_checklist_templates()
+    if templates.empty:
+        st.info("No custom templates yet. The built-in checklist is still available.")
+        return
+    template_options = {f"{row.name} · {row.created_by or 'Analyst'}": int(row.id) for row in templates.itertuples(index=False)}
+    chosen_label = st.selectbox("Template to apply", list(template_options), key=f"checklist_template_choice_{alert_id}")
+    template_id = template_options[chosen_label]
+    controls = st.columns(2)
+    with controls[0]:
+        if st.button("Apply template to this alert", key=f"apply_checklist_template_{alert_id}"):
+            selected_template = templates.loc[templates["id"].astype(int).eq(template_id)].iloc[0]
+            try:
+                steps = json.loads(str(selected_template["steps_json"]))
+            except (TypeError, ValueError):
+                steps = []
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            inserted = 0
+            with connect_db() as connection:
+                for index, step in enumerate(steps[:20]):
+                    cursor = connection.execute(
+                        "INSERT OR IGNORE INTO alert_checklist (alert_id, item_key, label, completed, updated_at) VALUES (?, ?, ?, 0, ?)",
+                        (int(alert_id), f"template_{template_id}_{index}", str(step)[:300], now),
+                    )
+                    inserted += int(cursor.rowcount > 0)
+            record_alert_timeline(int(alert_id), "Checklist template applied", f"{selected_template['name']}: {inserted} step(s) added.")
+            audit_event("investigation_checklist_template_applied", f"alert_id={alert_id}; template_id={template_id}; added={inserted}")
+            st.success(f"Added {inserted} checklist step(s) to this alert.")
+            st.rerun()
+    if is_admin():
+        with controls[1]:
+            if st.button("Delete selected template", key=f"delete_checklist_template_{alert_id}", type="secondary"):
+                with connect_db() as connection:
+                    connection.execute("DELETE FROM investigation_checklist_templates WHERE id = ?", (template_id,))
+                audit_event("investigation_checklist_template_deleted", f"template_id={template_id}")
+                st.success("Template deleted. Steps already applied to alerts remain in their checklists.")
+                st.rerun()
 
 
 def load_custom_detection_rules(enabled_only=False):
@@ -2484,6 +2621,8 @@ def sync_sensor_health_alert(report, source):
     is_down = str(report.get("status", "")).lower().startswith(("offline", "stopped"))
     last_heartbeat = str(report.get("last_heartbeat", "Unknown"))
     has_seen_sensor = last_heartbeat not in {"Never", "Unknown", ""}
+    if is_down and has_seen_sensor and active_sensor_maintenance(mode):
+        return
     with connect_db() as connection:
         state_row = connection.execute("SELECT value FROM app_state WHERE key = ?", (state_key,)).fetchone()
         episode = state_row[0] if state_row else ""
@@ -2524,6 +2663,75 @@ def sync_sensor_health_alert(report, source):
             record_alert_timeline(int(alert_id), "Sensor recovered", f"{mode.title()} sensor heartbeat is healthy again; alert resolved.")
         if rows:
             audit_event("sensor_health_recovered", f"source={mode}; resolved_alerts={len(rows)}")
+
+
+def active_sensor_maintenance(scope):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT id, end_at, reason FROM sensor_maintenance_windows "
+            "WHERE scope = ? AND enabled = 1 AND start_at <= ? AND end_at >= ? "
+            "ORDER BY end_at LIMIT 1",
+            (str(scope), now, now),
+        ).fetchone()
+    return row
+
+
+def render_sensor_maintenance_manager():
+    st.markdown("#### Sensor maintenance schedule")
+    st.caption("A scheduled Local or Cloud window suppresses only new automatic sensor-offline alerts for that scope. Existing alerts remain open; after the window, normal outage alerting resumes.")
+    if is_admin():
+        scopes = ["Local", "Cloud"]
+        with st.form("sensor_maintenance_window_form", clear_on_submit=True):
+            scope = st.selectbox("Sensor scope", scopes, key="maintenance_scope")
+            now = datetime.now(timezone.utc)
+            start_day = st.date_input("Start date (UTC)", value=now.date(), key="maintenance_start_day")
+            start_clock = st.time_input("Start time (UTC)", value=now.time().replace(second=0, microsecond=0), key="maintenance_start_clock")
+            duration = st.selectbox("Duration", [0.5, 1, 2, 4, 8, 24], format_func=lambda value: f"{value:g} hour(s)", key="maintenance_duration")
+            reason = st.text_input("Maintenance reason", max_chars=240, placeholder="e.g. planned OS update")
+            create_window = st.form_submit_button("Schedule maintenance window")
+        if create_window:
+            start_at = datetime.combine(start_day, start_clock, tzinfo=timezone.utc)
+            end_at = start_at + timedelta(hours=float(duration))
+            if end_at <= now:
+                st.error("Choose a maintenance window that has not already ended.")
+            elif not reason.strip():
+                st.error("Add a short reason so other analysts know why alerting is muted.")
+            else:
+                created_at = now.isoformat(timespec="seconds")
+                with connect_db() as connection:
+                    connection.execute(
+                        "INSERT INTO sensor_maintenance_windows (scope, start_at, end_at, reason, enabled, created_by, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        (scope.lower(), start_at.isoformat(timespec="seconds"), end_at.isoformat(timespec="seconds"), reason.strip()[:240], str(st.session_state.get("username", "Admin"))[:120], created_at),
+                    )
+                audit_event("sensor_maintenance_window_created", f"scope={scope.lower()}; start={start_at.isoformat()}; end={end_at.isoformat()}")
+                st.success("Maintenance window scheduled.")
+                st.rerun()
+    else:
+        st.info("Admin access is required to schedule or cancel maintenance windows.")
+    with connect_db() as connection:
+        windows = pd.read_sql_query("SELECT id, scope, start_at, end_at, reason, enabled, created_by FROM sensor_maintenance_windows ORDER BY start_at DESC LIMIT 50", connection)
+    if windows.empty:
+        st.info("No sensor maintenance windows are scheduled.")
+        return
+    now_utc = pd.Timestamp.now(tz="UTC")
+    start_times = pd.to_datetime(windows["start_at"], errors="coerce", utc=True)
+    end_times = pd.to_datetime(windows["end_at"], errors="coerce", utc=True)
+    windows["Status"] = "Scheduled"
+    windows.loc[start_times.le(now_utc) & end_times.ge(now_utc) & windows["enabled"].astype(bool), "Status"] = "Active"
+    windows.loc[end_times.lt(now_utc), "Status"] = "Expired"
+    windows.loc[~windows["enabled"].astype(bool), "Status"] = "Cancelled"
+    st.dataframe(windows.rename(columns={"id":"ID", "scope":"Scope", "start_at":"Start (UTC)", "end_at":"End (UTC)", "reason":"Reason", "created_by":"Created by"})[["ID", "Scope", "Start (UTC)", "End (UTC)", "Reason", "Status", "Created by"]], hide_index=True, width="stretch")
+    active_options = {f"#{int(row.id)} · {row.scope.title()} · {row.start_at}": int(row.id) for row in windows.itertuples(index=False) if bool(row.enabled) and pd.to_datetime(row.end_at, utc=True, errors="coerce") >= now_utc}
+    if is_admin() and active_options:
+        chosen = st.selectbox("Window to cancel", list(active_options), key="maintenance_cancel_choice")
+        if st.button("Cancel selected window", key="maintenance_cancel_button"):
+            window_id = active_options[chosen]
+            with connect_db() as connection:
+                connection.execute("UPDATE sensor_maintenance_windows SET enabled = 0 WHERE id = ?", (window_id,))
+            audit_event("sensor_maintenance_window_cancelled", f"id={window_id}")
+            st.success("Maintenance window cancelled.")
+            st.rerun()
 
 
 @st.fragment(run_every="10s")
@@ -3484,6 +3692,63 @@ def render_analytics(report):
         events, source = pd.DataFrame(), "unavailable"
         st.warning(f"Live event analytics unavailable: {error}")
     alerts = load_alerts()
+    comparison_hours = st.selectbox("Comparison window", [24, 168, 720], index=1, format_func=lambda value: {24:"24 hours", 168:"7 days", 720:"30 days"}[value], key="analytics_comparison_window")
+    now_utc = pd.Timestamp.now(tz="UTC")
+    current_start = now_utc - pd.Timedelta(hours=int(comparison_hours))
+    previous_start = current_start - pd.Timedelta(hours=int(comparison_hours))
+    if not events.empty:
+        event_time_col = next((name for name in ("occurred_at", "created_at") if name in events.columns), None)
+        event_times = pd.to_datetime(events[event_time_col], errors="coerce", utc=True) if event_time_col else pd.Series(pd.NaT, index=events.index)
+        current_events = int(event_times.ge(current_start).sum())
+        previous_events = int((event_times.ge(previous_start) & event_times.lt(current_start)).sum())
+    else:
+        event_time_col = None
+        event_times = pd.Series(dtype="datetime64[ns, UTC]")
+        current_events = previous_events = 0
+    if not alerts.empty and "created_at" in alerts.columns:
+        alert_times = pd.to_datetime(alerts["created_at"], errors="coerce", utc=True)
+        current_alerts = int(alert_times.ge(current_start).sum())
+        previous_alerts = int((alert_times.ge(previous_start) & alert_times.lt(current_start)).sum())
+    else:
+        alert_times = pd.Series(dtype="datetime64[ns, UTC]")
+        current_alerts = previous_alerts = 0
+    st.subheader("Current period vs previous period")
+    current_metrics = st.columns(2)
+    current_metrics[0].metric("Endpoint events", current_events, delta=f"{current_events - previous_events:+} vs previous")
+    current_metrics[1].metric("Alerts created", current_alerts, delta=f"{current_alerts - previous_alerts:+} vs previous")
+    st.caption(f"Current: since {current_start.strftime('%Y-%m-%d %H:%M UTC')} · Previous: {previous_start.strftime('%Y-%m-%d %H:%M UTC')} to current start. Comparison uses the most recent 5,000 events available.")
+
+    st.subheader("Alert trends by severity")
+    if not alerts.empty and "created_at" in alerts.columns:
+        trend = alerts.copy()
+        trend["_time"] = pd.to_datetime(trend["created_at"], errors="coerce", utc=True)
+        trend = trend[trend["_time"].ge(previous_start)]
+        if not trend.empty:
+            trend["Day"] = trend["_time"].dt.strftime("%Y-%m-%d")
+            trend["Severity"] = trend.get("severity", pd.Series("Unknown", index=trend.index)).fillna("Unknown").astype(str)
+            st.bar_chart(trend.groupby(["Day", "Severity"]).size().unstack(fill_value=0))
+        else:
+            st.info("No alerts were created in the selected comparison window.")
+    else:
+        st.info("Alert timestamps are not available for trend charts.")
+
+    st.subheader("Analyst workload")
+    if not alerts.empty:
+        active_work = alerts[alerts.get("status", pd.Series(index=alerts.index, dtype=str)).astype(str).isin(["Open", "Acknowledged"])].copy()
+        if not active_work.empty:
+            active_work["Analyst"] = active_work.get("assigned_to", pd.Series("", index=active_work.index)).fillna("").astype(str).str.strip().replace("", "Unassigned")
+            active_work["_due"] = pd.to_datetime(active_work.get("due_at", pd.Series(index=active_work.index, dtype=str)), errors="coerce", utc=True)
+            active_work["_overdue"] = active_work["_due"].notna() & active_work["_due"].lt(now_utc)
+            active_work["_critical"] = active_work.get("severity", pd.Series("", index=active_work.index)).astype(str).str.casefold().eq("critical")
+            workload = active_work.groupby("Analyst").agg(
+                **{"Active alerts": ("id", "count"), "Overdue": ("_overdue", "sum"), "Critical": ("_critical", "sum")}
+            ).reset_index().sort_values(["Overdue", "Critical", "Active alerts"], ascending=False)
+            st.dataframe(workload, hide_index=True, width="stretch")
+        else:
+            st.info("There are no open or acknowledged alerts to assign.")
+    else:
+        st.info("Alert records are not available for workload analysis.")
+
     critical_alerts = int(alerts["severity"].eq("Critical").sum()) if not alerts.empty else 0
     anomaly_alerts = int(alerts["title"].astype(str).str.startswith("AI anomaly:").sum()) if not alerts.empty else 0
     a, b, c, d = st.columns(4)
@@ -5000,6 +5265,7 @@ def render_alert_system():
     render_alert_ioc_extractor(selected_alert.to_dict())
 
     st.markdown("#### Investigation and response checklist")
+    render_investigation_checklist_templates(selected_id)
     checklist = load_alert_checklist(selected_id)
     completed_count = int(checklist["completed"].astype(bool).sum())
     st.progress(
@@ -5657,6 +5923,7 @@ def render_sensor_diagnostics():
     columns[2].metric("Last event", report.get("last_event", "Unknown"))
     columns[3].metric("Cloud sync queue", report.get("pending", "Unknown"))
     st.caption(report.get("explanation", "No diagnostic details."))
+    render_sensor_maintenance_manager()
 
     checks = []
     try:
