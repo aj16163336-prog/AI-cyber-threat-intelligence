@@ -1015,9 +1015,13 @@ def init_database():
                 sensor_id TEXT PRIMARY KEY,
                 display_name TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
+                criticality TEXT NOT NULL DEFAULT 'Unclassified',
                 updated_at TEXT NOT NULL
             )"""
         )
+        registry_columns = {row[1] for row in connection.execute("PRAGMA table_info(sensor_registry)")}
+        if "criticality" not in registry_columns:
+            connection.execute("ALTER TABLE sensor_registry ADD COLUMN criticality TEXT NOT NULL DEFAULT 'Unclassified'")
         connection.execute(
             """CREATE TABLE IF NOT EXISTS ai_baseline_events (
                 sensor_id TEXT NOT NULL,
@@ -5877,22 +5881,34 @@ def render_asset_inventory():
                 "INSERT OR IGNORE INTO sensor_registry (sensor_id, display_name, tags, updated_at) VALUES (?, '', '', ?)",
                 (row["Sensor ID"], datetime.now(timezone.utc).isoformat(timespec="seconds")),
             )
-        registry = pd.read_sql_query("SELECT sensor_id, display_name, tags FROM sensor_registry", connection)
+        registry = pd.read_sql_query("SELECT sensor_id, display_name, tags, criticality FROM sensor_registry", connection)
     registry_by_id = {str(item["sensor_id"]): item for item in registry.to_dict("records")}
     for row in sensor_rows:
         metadata = registry_by_id.get(row["Sensor ID"], {})
         row["Device"] = str(metadata.get("display_name") or row["Sensor ID"][:12])
         row["Tags"] = str(metadata.get("tags") or "")
+        row["Criticality"] = str(metadata.get("criticality") or "Unclassified")
+    criticality_bonus = {"Critical": 30, "High": 20, "Standard": 10, "Low": 0, "Unclassified": 5}
+    fleet_priority = []
+    for row in sensor_rows:
+        event_risk = max(0, min(100, int(row.get("Highest observed risk", 0) or 0)))
+        stale_bonus = 10 if str(row.get("Status", "")).lower() in ("offline", "no recent event") else 0
+        priority = min(100, round(event_risk * 0.7 + criticality_bonus.get(row["Criticality"], 5) + stale_bonus))
+        row["Triage priority"] = priority
+        fleet_priority.append(priority)
     st.caption(f"Event source: {source} · Heartbeat source: {heartbeat_source} · Visible sensors: {len(sensor_rows)}")
     if not sensor_rows:
         st.info("No sensor inventory is available yet. Start the endpoint sensor and wait for its first event or heartbeat.")
         return
-    fleet = pd.DataFrame(sensor_rows)
+    fleet = pd.DataFrame(sensor_rows).sort_values("Triage priority", ascending=False, kind="stable")
     metrics = st.columns(4)
     metrics[0].metric("Devices", len(fleet))
     metrics[1].metric("Online", int(fleet["Status"].astype(str).eq("Online").sum()))
     metrics[2].metric("Offline / stale", int(fleet["Status"].astype(str).isin(["Offline", "No recent event"]).sum()))
     metrics[3].metric("Recent events", int(pd.to_numeric(fleet["Observed events"], errors="coerce").fillna(0).sum()))
+    st.caption("Triage priority combines observed event risk, asset criticality, and stale status. It is a review-order aid, not a compromise probability or verdict.")
+    if fleet_priority:
+        st.metric("Highest-priority assets", sum(score >= 70 for score in fleet_priority))
     st.subheader("Sensor telemetry coverage")
     coverage_hours = st.selectbox(
         "Review window",
@@ -5983,17 +5999,22 @@ def render_asset_inventory():
     device_ids = fleet["Sensor ID"].astype(str).tolist()
     selected_sensor = st.selectbox("Device to label or inspect", device_ids, format_func=lambda value: f"{registry_by_id.get(value, {}).get('display_name') or value[:12]} · {value[:20]}")
     selected_meta = registry_by_id.get(selected_sensor, {})
+    criticality_options = ["Critical", "High", "Standard", "Low", "Unclassified"]
+    selected_criticality = str(selected_meta.get("criticality") or "Unclassified")
+    if selected_criticality not in criticality_options:
+        selected_criticality = "Unclassified"
     with st.form("sensor_registry_form"):
         display_name = st.text_input("Device name", value=str(selected_meta.get("display_name") or ""), max_chars=100)
         tags = st.text_input("Tags (comma-separated)", value=str(selected_meta.get("tags") or ""), max_chars=200, placeholder="finance, laptop, server")
+        criticality = st.selectbox("Asset criticality", criticality_options, index=criticality_options.index(selected_criticality), help="Use your organization's asset inventory policy to classify business impact.")
         save_device = st.form_submit_button("Save device details")
     if save_device:
         with connect_db() as connection:
             connection.execute(
-                "INSERT INTO sensor_registry (sensor_id, display_name, tags, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(sensor_id) DO UPDATE SET display_name=excluded.display_name, tags=excluded.tags, updated_at=excluded.updated_at",
-                (selected_sensor, display_name.strip(), tags.strip(), datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                "INSERT INTO sensor_registry (sensor_id, display_name, tags, criticality, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(sensor_id) DO UPDATE SET display_name=excluded.display_name, tags=excluded.tags, criticality=excluded.criticality, updated_at=excluded.updated_at",
+                (selected_sensor, display_name.strip(), tags.strip(), criticality, datetime.now(timezone.utc).isoformat(timespec="seconds")),
             )
-        audit_event("fleet_device_details_updated", f"sensor_id={selected_sensor}; name={display_name.strip()[:100]}")
+        audit_event("fleet_device_details_updated", f"sensor_id={selected_sensor}; name={display_name.strip()[:100]}; criticality={criticality}")
         st.success("Device details saved.")
         st.rerun()
     if not events.empty:
