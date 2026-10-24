@@ -52,6 +52,8 @@ from ai_copilot import (
     build_event_context,
     build_evaluation_context,
     build_handover_context,
+    build_incident_timeline_context,
+    build_investigation_brief_context,
     generate_review,
 )
 from live_capture import capture_summary, list_interfaces
@@ -2947,6 +2949,41 @@ def make_incident_pdf(incident, alerts, timeline):
     return buffer.getvalue()
 
 
+def build_incident_ai_summary_source(incident, linked_alerts, timeline, actions, post_review):
+    """Create a privacy-limited, aggregate source for the two opt-in incident AI tools."""
+    alert_severities = {}
+    alert_statuses = {}
+    if linked_alerts is not None and not linked_alerts.empty:
+        if "severity" in linked_alerts:
+            alert_severities = linked_alerts["severity"].fillna("Unknown").astype(str).value_counts().to_dict()
+        if "status" in linked_alerts:
+            alert_statuses = linked_alerts["status"].fillna("Unknown").astype(str).value_counts().to_dict()
+    action_statuses = {}
+    if actions is not None and not actions.empty and "status" in actions:
+        action_statuses = actions["status"].fillna("Unknown").astype(str).value_counts().to_dict()
+    timeline_events = []
+    if timeline is not None and not timeline.empty:
+        ordered = timeline.sort_values("occurred_at", ascending=True) if "occurred_at" in timeline else timeline
+        for item in ordered.tail(40).to_dict("records"):
+            timeline_events.append({
+                "occurred_at": str(item.get("occurred_at") or "")[:40],
+                "event_type": str(item.get("event_type") or "Activity")[:48],
+            })
+    raw = {
+        "incident_id": int(incident.get("id", 0) or 0),
+        "severity": str(incident.get("severity", "Unknown")),
+        "status": str(incident.get("status", "Unknown")),
+        "linked_alert_count": len(linked_alerts) if linked_alerts is not None else 0,
+        "alert_severity_counts": alert_severities,
+        "alert_status_counts": alert_statuses,
+        "timeline_event_count": len(timeline) if timeline is not None else 0,
+        "timeline": timeline_events,
+        "follow_up_status_counts": action_statuses,
+        "post_review_status": (post_review or {}).get("review_status", "Draft"),
+    }
+    return raw
+
+
 def build_shift_handover_brief(events, alerts, incidents, event_source):
     """Build a factual, exportable shift summary and bounded AI-review payload."""
     now = datetime.now(timezone.utc)
@@ -4023,6 +4060,76 @@ def analyze_live_events(events, model_minimum=20):
     return events, model_label
 
 
+def build_device_baseline_profiles(scored_events):
+    """Summarize each sensor's own learned activity and current deviations."""
+    if scored_events is None or scored_events.empty:
+        return pd.DataFrame()
+    frame = scored_events.copy()
+    if "sensor_id" not in frame:
+        frame["sensor_id"] = "Local sensor"
+    frame["sensor_id"] = frame["sensor_id"].fillna("Local sensor").astype(str).replace("", "Local sensor")
+    for column in ("risk_score", "Device baseline score", "Baseline sample count", "AI anomaly score"):
+        if column not in frame:
+            frame[column] = 0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    rows = []
+    for sensor_id, group in frame.groupby("sensor_id", dropna=False):
+        event_types = group.get("event_type", pd.Series(dtype=str)).fillna("Unknown").astype(str).value_counts()
+        processes = group.get("process_name", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+        processes = processes[processes.ne("")].value_counts()
+        latest_column = next((column for column in ("occurred_at", "created_at") if column in group), None)
+        latest = "Unknown"
+        if latest_column:
+            parsed_latest = pd.to_datetime(group[latest_column], errors="coerce", utc=True).max()
+            if pd.notna(parsed_latest):
+                latest = parsed_latest.isoformat()
+        sample_count = int(group["Baseline sample count"].max()) if len(group) else 0
+        rows.append({
+            "Device": str(sensor_id)[:16],
+            "Events in window": len(group),
+            "Baseline history": sample_count,
+            "Baseline stage": "Established" if sample_count >= 20 else f"Building ({sample_count}/20)",
+            "Baseline deviations": int(group["Device baseline score"].ge(60).sum()),
+            "AI anomalies": int(group.get("AI anomaly", pd.Series(False, index=group.index)).fillna(False).astype(bool).sum()),
+            "Average sensor risk": round(float(group["risk_score"].mean()), 1),
+            "Common event types": ", ".join(event_types.head(3).index.tolist()) or "Unknown",
+            "Common processes": ", ".join(processes.head(3).index.tolist()) or "Not reported",
+            "Last event (UTC)": latest,
+        })
+    return pd.DataFrame(rows).sort_values(["Baseline deviations", "AI anomalies", "Events in window"], ascending=[False, False, False]).reset_index(drop=True)
+
+
+def render_device_baseline_profiles():
+    st.subheader("Device-specific behavior baselines")
+    st.caption("Each connected sensor is compared with its own earlier event types, processes, and risk levels. New activity is a review signal, not a malware verdict.")
+    try:
+        events, source = load_sensor_events(limit=2000)
+        if events.empty:
+            st.info("No sensor events are available to build device profiles yet.")
+            return
+        scored, model_label = analyze_live_events(events)
+        profiles = build_device_baseline_profiles(scored)
+    except Exception as error:
+        st.warning(f"Could not build device-specific profiles: {type(error).__name__}")
+        return
+    if profiles.empty:
+        st.info("Device profile data is not available for this event sample.")
+        return
+    st.caption(f"Source: {source} · {model_label} · Profiles use the current recent-event window.")
+    st.dataframe(profiles, hide_index=True, width="stretch")
+    baseline_scores = pd.to_numeric(
+        scored.get("Device baseline score", pd.Series(0, index=scored.index)), errors="coerce"
+    ).fillna(0)
+    anomalies = scored[baseline_scores.ge(60)].copy()
+    if not anomalies.empty:
+        st.markdown("##### Recent deviations to review")
+        display_columns = [column for column in (
+            "occurred_at", "created_at", "sensor_id", "event_type", "process_name",
+            "Device baseline score", "Device baseline reason", "AI risk score", "summary",
+        ) if column in anomalies]
+        st.dataframe(anomalies[display_columns].head(50), hide_index=True, width="stretch")
+
+
 def render_live_ai_toggle():
     api_key_configured = bool(setting("OPENAI_API_KEY"))
     default_enabled = api_key_configured
@@ -4584,6 +4691,8 @@ def render_ai_engine(report):
         render_live_ai_panel(live_openai_enabled=live_openai_enabled)
 
     live_panel()
+    with st.expander("Device-specific behavior baselines", expanded=True):
+        render_device_baseline_profiles()
     render_ai_feedback_threshold_lab()
     with st.expander("Historical UNSW-NB15 model output"):
         st.write("This is a separate offline dataset report. It is not used to label live files or endpoint activity.")
@@ -4954,6 +5063,32 @@ def render_mitre_map():
         st.dataframe(mapping, hide_index=True, width="stretch", column_config={"Reference": st.column_config.LinkColumn("ATT&CK reference")})
     else:
         st.info("No current signals matched the configured ATT&CK mapping rules.")
+    st.markdown("#### AI-assisted ATT&CK coverage review")
+    st.caption("Compares only the techniques covered by this project's mapping rules with the current event and alert sample. ‘Not observed’ means there was no matching record here; it does not prove a detection gap or absence of activity.")
+    coverage = build_mitre_coverage(events, alerts)
+    observed = int(coverage["Mapped observations"].gt(0).sum()) if not coverage.empty else 0
+    total = len(coverage)
+    coverage_metrics = st.columns(3)
+    coverage_metrics[0].metric("Techniques in this review", total)
+    coverage_metrics[1].metric("Observed in sample", observed)
+    coverage_metrics[2].metric("Not observed", total - observed)
+    st.dataframe(coverage, hide_index=True, width="stretch")
+    st.caption("Use the suggested telemetry check to validate collection with your security team before changing detections.")
+    render_optional_ai_review(
+        payload={
+            "mapped_technique_count": total,
+            "techniques_observed": [
+                {"technique_id": row["Technique ID"], "matched_records": int(row["Mapped observations"])}
+                for row in coverage.to_dict("records") if int(row["Mapped observations"]) > 0
+            ],
+            "techniques_not_observed_in_sample": [
+                row["Technique ID"] for row in coverage.to_dict("records") if int(row["Mapped observations"]) == 0
+            ],
+        },
+        review_type="mitre_coverage",
+        key_suffix="current_sample",
+        disclosure="Only technique IDs and aggregate match counts from the limited project mapping catalog are sent; endpoint records and indicators are excluded.",
+    )
 
 
 def map_signal_to_mitre(signal):
@@ -4972,6 +5107,45 @@ def map_signal_to_mitre(signal):
         if re.search(pattern, text, flags=re.I):
             matches.append({"Technique ID": technique_id, "Technique": technique, "Mapping rationale": rationale, "Confidence": "Possible", "Reference": reference})
     return matches
+
+
+MITRE_COVERAGE_CATALOG = [
+    ("T1071", "Application Layer Protocol", "Validate proxy, DNS, and outbound connection telemetry."),
+    ("T1110.001", "Password Guessing", "Review Windows authentication failure logs, including Event ID 4625."),
+    ("T1059.001", "PowerShell", "Check whether PowerShell Script Block Logging is collected."),
+    ("T1498.001", "Direct Network Flood", "Validate network flow or packet-rate telemetry at the network boundary."),
+    ("T1046", "Network Service Discovery", "Review connection and destination-port diversity telemetry."),
+    ("T1595", "Active Scanning", "Check firewall or IDS records for scanning and probe activity."),
+    ("T1204.002", "Malicious File", "Confirm file execution and process lineage are visible to the endpoint sensor."),
+]
+
+
+def build_mitre_coverage(events, alerts):
+    """Count known-rule observations and label unobserved techniques cautiously."""
+    observations = {technique_id: 0 for technique_id, _, _ in MITRE_COVERAGE_CATALOG}
+    sources = []
+    if events is not None and not events.empty:
+        sources.extend(("event", record) for record in events.to_dict("records"))
+    if alerts is not None and not alerts.empty:
+        sources.extend(("alert", record) for record in alerts.to_dict("records"))
+    for source_type, record in sources:
+        signal_fields = ("event_type", "summary", "details") if source_type == "event" else ("title", "details")
+        signal = " ".join(str(record.get(field, "") or "") for field in signal_fields)
+        for technique in map_signal_to_mitre(signal):
+            technique_id = technique["Technique ID"]
+            if technique_id in observations:
+                observations[technique_id] += 1
+    rows = []
+    for technique_id, name, next_check in MITRE_COVERAGE_CATALOG:
+        count = observations[technique_id]
+        rows.append({
+            "Technique ID": technique_id,
+            "Technique": name,
+            "Mapped observations": count,
+            "Current sample": "Observed" if count else "Not observed in this sample",
+            "Suggested telemetry check": next_check,
+        })
+    return pd.DataFrame(rows).sort_values(["Mapped observations", "Technique ID"], ascending=[True, True]).reset_index(drop=True)
 
 
 def render_local_email_settings():
@@ -5103,6 +5277,132 @@ def render_related_alert_activity(selected_alert, alerts):
                 hide_index=True,
                 width="stretch",
             )
+
+
+def assess_false_positive_signals(alert):
+    """Create a transparent review heuristic; the score is not a learned probability."""
+    score = 50
+    reasons = []
+    evidence_count = 0
+    event = None
+    source_id = str(alert.get("source_event_id") or "")
+    if source_id.startswith(("endpoint:", "ai-endpoint:")):
+        event_id = alert_source_event_id(source_id)
+        try:
+            events, _ = load_sensor_events(limit=2000)
+            if not events.empty:
+                identity_column = next((column for column in ("event_id", "event_uid", "id") if column in events), None)
+                if identity_column and event_id:
+                    matches = events[events[identity_column].fillna("").astype(str).eq(event_id)]
+                    if not matches.empty:
+                        event = matches.iloc[0].to_dict()
+        except Exception:
+            event = None
+    severity = str(alert.get("severity") or "").title()
+    details = str(alert.get("details") or "")
+    title_details = f"{alert.get('title', '')} {details}".casefold()
+    if severity == "Critical":
+        score -= 25
+        reasons.append("Critical severity weighs against a benign interpretation")
+        evidence_count += 1
+    elif severity == "High":
+        score -= 16
+        reasons.append("High severity warrants continued review")
+        evidence_count += 1
+    elif severity == "Low":
+        score += 10
+        reasons.append("Low severity is a weak benign-leaning signal")
+        evidence_count += 1
+    risk_value = None
+    if event is not None:
+        try:
+            risk_value = max(0, min(100, float(event.get("risk_score") or 0)))
+        except (TypeError, ValueError):
+            risk_value = None
+    if risk_value is None:
+        risk_match = re.search(r"(?:sensor\s+)?risk(?:\s+score)?\s*[:=]\s*(\d{1,3})", details, re.I)
+        if risk_match:
+            risk_value = min(100, int(risk_match.group(1)))
+    if risk_value is not None:
+        evidence_count += 1
+        if risk_value <= 20:
+            score += 20
+            reasons.append(f"Low source risk score ({risk_value:g}/100) leans benign")
+        elif risk_value <= 40:
+            score += 10
+            reasons.append(f"Moderate-low source risk score ({risk_value:g}/100) leans slightly benign")
+        elif risk_value >= 80:
+            score -= 22
+            reasons.append(f"Elevated source risk score ({risk_value:g}/100) weighs against benign")
+        elif risk_value >= 60:
+            score -= 12
+            reasons.append(f"Raised source risk score ({risk_value:g}/100) needs review")
+    if re.search(r"IOC|threat.feed match|watchlist match|command.?and.?control", title_details, re.I):
+        score -= 30
+        evidence_count += 1
+        reasons.append("A threat-intelligence or watchlist indicator is recorded")
+    if re.search(r"AI anomaly|baseline deviation|unusual pattern|attack chain", title_details, re.I):
+        score -= 12
+        evidence_count += 1
+        reasons.append("An AI anomaly or behavior-deviation signal is attached")
+    if event is not None:
+        event_id = ai_event_identity(event)
+        if event_id:
+            try:
+                with connect_db() as connection:
+                    feedback = connection.execute(
+                        "SELECT verdict FROM ai_analyst_feedback WHERE event_id = ?", (event_id,)
+                    ).fetchone()
+                if feedback:
+                    evidence_count += 1
+                    if feedback[0] == "Benign":
+                        score += 30
+                        reasons.append("An analyst previously marked this exact event benign")
+                    elif feedback[0] == "Confirmed threat":
+                        score -= 40
+                        reasons.append("An analyst previously confirmed this exact event as a threat")
+            except sqlite3.Error:
+                pass
+    score = max(0, min(100, int(round(score))))
+    confidence = "Higher" if any("previously" in item for item in reasons) else "Medium" if evidence_count >= 3 else "Low"
+    if not reasons:
+        reasons.append("The saved alert contains too little structured evidence for a meaningful comparison")
+    return {"score": score, "reasons": reasons, "confidence": confidence, "evidence_count": evidence_count}
+
+
+def render_false_positive_assistant(alert):
+    st.markdown("#### False-positive review assistant")
+    assessment = assess_false_positive_signals(alert)
+    left, right = st.columns([1, 2])
+    left.metric("Benign-leaning heuristic", f"{assessment['score']}/100")
+    left.caption(f"Evidence confidence: {assessment['confidence']}")
+    if assessment["score"] >= 70:
+        right.info("Several available signals lean benign. Verify the event context before resolving the alert.")
+    elif assessment["score"] <= 35:
+        right.warning("Threat-like signals are stronger in the saved evidence. Continue investigation.")
+    else:
+        right.info("Signals are mixed or incomplete. Keep the alert open until an analyst verifies it.")
+    for reason in assessment["reasons"]:
+        st.markdown(f"- {reason}")
+    st.caption("This transparent triage heuristic is not a calibrated probability, does not close or suppress alerts, and may be wrong when event evidence is missing.")
+    st.caption("Optional generative review sends only alert severity, the heuristic score/confidence, and these short reason labels. It excludes alert titles, raw notes, IPs, paths, hashes, and usernames.")
+    render_optional_ai_review(
+        payload={
+            "alert_severity": str(alert.get("severity") or "Unknown")[:16],
+            "benign_leaning_heuristic_score": assessment["score"],
+            "evidence_confidence": assessment["confidence"],
+            "reason_labels": assessment["reasons"][:8],
+            "source_event_linked": event_source_is_available(alert),
+        },
+        review_type="false_positive",
+        key_suffix=f"alert_{int(alert.get('id', 0) or 0)}",
+        disclosure="This review sends the heuristic result and short reason labels only; alert text, notes, addresses, paths, hashes, and usernames are excluded.",
+    )
+
+
+def event_source_is_available(alert):
+    source_id = str(alert.get("source_event_id") or "")
+    return source_id.startswith(("endpoint:", "ai-endpoint:"))
 
 
 def render_alert_system():
@@ -5261,6 +5561,8 @@ def render_alert_system():
         st.caption(f"Created: {selected_alert.get('created_at', 'Unknown')}")
         st.caption(f"MITRE ATT&CK: {selected_alert.get('mitre_id') or 'Not mapped'}")
         st.text(str(selected_alert.get("details") or "No additional evidence was recorded."))
+
+    render_false_positive_assistant(selected_alert.to_dict())
 
     render_alert_ioc_extractor(selected_alert.to_dict())
 
@@ -5475,6 +5777,25 @@ def render_incident_management():
             st.error(str(error))
     if post_review.get("updated_at"):
         st.caption(f"Last updated by {post_review.get('updated_by') or 'Analyst'} at {post_review['updated_at']} UTC · {post_review['review_status']}")
+    ai_summary_source = build_incident_ai_summary_source(
+        selected_incident.to_dict(), linked_alerts, timeline, actions, post_review
+    )
+    st.markdown("#### AI incident timeline summary")
+    st.caption("Optional, one-time AI summary. Only incident severity/status, alert and action counts, plus UTC activity timestamps and labels are sent. Notes, alert titles, host names, IPs, file paths, hashes, and analyst names are excluded.")
+    render_optional_ai_review(
+        payload=build_incident_timeline_context(ai_summary_source),
+        review_type="incident_timeline",
+        key_suffix=f"incident_{int(selected_id)}",
+        disclosure="This review sends only the redacted aggregate incident timeline shown in the preview; no free-text notes or indicators are included.",
+    )
+    st.markdown("#### AI investigation brief")
+    st.caption("Generate a handover-style brief from incident status, severity counts, action status counts, and timeline activity labels. It does not include analyst notes or raw indicators.")
+    render_optional_ai_review(
+        payload=build_investigation_brief_context(ai_summary_source),
+        review_type="investigation_brief",
+        key_suffix=f"incident_{int(selected_id)}",
+        disclosure="This review sends only aggregate incident status, severity/status counts, timeline activity labels, and open-work counts; no free-text notes or indicators are included.",
+    )
     csv_parts = []
     summary_row = selected_incident.to_frame().T
     summary_row.insert(0, "record_type", "incident")
@@ -5631,6 +5952,123 @@ def render_log_analyzer():
         st.success(f"Created {inserted} new alert(s); repeated imports were deduplicated.")
 
 
+def parse_natural_language_hunt(query):
+    """Translate a small, transparent set of analyst phrases into safe event filters."""
+    text = re.sub(r"\s+", " ", str(query or "").strip().lower())
+    intent = {
+        "lookback_hours": 24,
+        "minimum_risk": 0,
+        "severities": [],
+        "event_families": [],
+        "remote_ip": "",
+        "search_terms": [],
+    }
+    duration = re.search(r"\b(?:last|past|within)\s+(\d{1,4})\s*(minutes?|mins?|hours?|hrs?|days?|weeks?)\b", text)
+    if duration:
+        amount = int(duration.group(1))
+        unit = duration.group(2)
+        multiplier = 1 / 60 if unit.startswith(("min",)) else 24 if unit.startswith("day") else 168 if unit.startswith("week") else 1
+        intent["lookback_hours"] = max(1, min(24 * 90, int(amount * multiplier + 0.999)))
+    elif re.search(r"\blast hour\b", text):
+        intent["lookback_hours"] = 1
+    elif re.search(r"\blast day\b|\btoday\b", text):
+        intent["lookback_hours"] = 24
+    elif re.search(r"\blast week\b|\bthis week\b", text):
+        intent["lookback_hours"] = 168
+
+    if re.search(r"\bcritical\b", text):
+        intent["minimum_risk"] = 85
+        intent["severities"] = ["Critical"]
+    elif re.search(r"\bhigh(?:[- ]risk| severity)?\b", text):
+        intent["minimum_risk"] = 70
+        intent["severities"] = ["High", "Critical"]
+    elif re.search(r"\b(?:suspicious|unusual|anomal(?:y|ies))\b", text):
+        intent["minimum_risk"] = 60
+        intent["severities"] = ["Review", "High", "Critical"]
+    elif re.search(r"\bmedium\b", text):
+        intent["severities"] = ["Medium"]
+    elif re.search(r"\blow\b", text):
+        intent["severities"] = ["Low"]
+
+    family_patterns = {
+        "network": r"\b(network|connection|connections|outbound|destination|traffic)\b",
+        "file": r"\b(file|files|created|modified|download)\b",
+        "process": r"\b(process|processes|application|executable)\b",
+        "authentication": r"\b(login|logins|sign[ -]?in|authentication|auth|failed password)\b",
+    }
+    for family, pattern in family_patterns.items():
+        if re.search(pattern, text):
+            intent["event_families"].append(family)
+
+    ip_match = re.search(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", text)
+    if ip_match:
+        try:
+            intent["remote_ip"] = str(ipaddress.ip_address(ip_match.group(0)))
+        except ValueError:
+            pass
+
+    remainder = text
+    if duration:
+        remainder = remainder.replace(duration.group(0), " ")
+    remainder = re.sub(r"\b(?:last hour|last day|today|last week|this week)\b", " ", remainder)
+    if intent["remote_ip"]:
+        remainder = remainder.replace(ip_match.group(0), " ")
+    for pattern in family_patterns.values():
+        remainder = re.sub(pattern, " ", remainder)
+    remainder = re.sub(r"(?<=\w)-(?=\w)", " ", remainder)
+    remainder = re.sub(r"\b(?:critical|high|risk|severity|medium|low|suspicious|unusual|anomaly|anomalies|show|find|list|search|review|all|the|for|with|from|in|of|and|last|past|within|hours?|hrs?|days?|weeks?|minutes?|mins?|events?|alerts?)\b", " ", remainder)
+    intent["search_terms"] = list(dict.fromkeys(re.findall(r"[a-z0-9_.+-]+", remainder)))[:8]
+    return intent
+
+
+def apply_natural_language_hunt(events, query, now=None):
+    """Return filtered event metadata and the plain-language query interpretation."""
+    intent = parse_natural_language_hunt(query)
+    data = events.copy() if events is not None else pd.DataFrame()
+    if data.empty:
+        return data, intent
+    if "risk_score" in data:
+        risk = pd.to_numeric(data["risk_score"], errors="coerce").fillna(0)
+        data = data[risk.ge(intent["minimum_risk"])].copy()
+    if intent["severities"] and "severity" in data:
+        data = data[data["severity"].fillna("").astype(str).str.title().isin(intent["severities"])].copy()
+    if intent["event_families"] and "event_type" in data:
+        event_type = data["event_type"].fillna("").astype(str).str.lower()
+        family_masks = []
+        for family in intent["event_families"]:
+            if family == "network":
+                family_masks.append(event_type.str.contains(r"network|connection", regex=True))
+            elif family == "file":
+                family_masks.append(event_type.str.startswith("file_"))
+            elif family == "process":
+                family_masks.append(event_type.str.startswith("process_"))
+            else:
+                family_masks.append(event_type.str.contains(r"auth|login|sign.?in", regex=True))
+        combined_mask = family_masks[0]
+        for mask in family_masks[1:]:
+            combined_mask = combined_mask | mask
+        data = data[combined_mask].copy()
+    if intent["remote_ip"] and "remote_ip" in data:
+        data = data[data["remote_ip"].fillna("").astype(str).eq(intent["remote_ip"])].copy()
+    if intent["lookback_hours"]:
+        time_column = next((column for column in ("occurred_at", "created_at") if column in data), None)
+        if time_column:
+            parsed = pd.to_datetime(data[time_column], errors="coerce", utc=True)
+            reference_time = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="UTC")
+            if reference_time.tzinfo is None:
+                reference_time = reference_time.tz_localize("UTC")
+            cutoff = reference_time - pd.Timedelta(hours=int(intent["lookback_hours"]))
+            data = data[parsed.notna() & parsed.ge(cutoff)].copy()
+    if intent["search_terms"]:
+        columns = [column for column in ("summary", "details", "process_name", "remote_ip", "file_name", "file_path") if column in data]
+        if columns:
+            searchable = data[columns].fillna("").astype(str).agg(" ".join, axis=1).str.casefold()
+            for term in intent["search_terms"]:
+                data = data[searchable.loc[data.index].str.contains(re.escape(term), regex=True, na=False)].copy()
+                searchable = searchable.loc[data.index]
+    return data, intent
+
+
 @st.fragment(run_every="10s")
 def render_threat_hunting():
     render_page_heading("Threat Hunting")
@@ -5647,6 +6085,40 @@ def render_threat_hunting():
     if st.button("Refresh now", key="threat_hunt_refresh"):
         load_sensor_events.clear()
         st.rerun()
+
+    with st.expander("Natural-language threat hunt", expanded=False):
+        st.caption("Describe a time window, severity, event family, IP, or process. The local parser shows its interpretation before results; no query is sent to an AI provider.")
+        natural_query = st.text_input(
+            "What do you want to find?",
+            placeholder="Show high-risk network events from the last 24 hours",
+            key="natural_language_hunt_query",
+        )
+        if natural_query.strip():
+            natural_results, intent = apply_natural_language_hunt(events, natural_query)
+            interpreted = [f"Last {intent['lookback_hours']} hour(s)"]
+            if intent["minimum_risk"]:
+                interpreted.append(f"risk ≥ {intent['minimum_risk']}")
+            if intent["severities"]:
+                interpreted.append("severity: " + ", ".join(intent["severities"]))
+            if intent["event_families"]:
+                interpreted.append("event family: " + ", ".join(intent["event_families"]))
+            if intent["remote_ip"]:
+                interpreted.append(f"IP: {intent['remote_ip']}")
+            if intent["search_terms"]:
+                interpreted.append("text: " + " ".join(intent["search_terms"]))
+            st.info("Interpreted as: " + " · ".join(interpreted))
+            st.metric("Matching events", len(natural_results))
+            if natural_results.empty:
+                st.caption("No events matched. Try a broader time window or simpler wording.")
+            else:
+                st.dataframe(natural_results.head(100), hide_index=True, width="stretch")
+                st.download_button(
+                    "Download natural-language hunt results (CSV)",
+                    natural_results.to_csv(index=False).encode("utf-8-sig"),
+                    "natural_language_hunt.csv",
+                    "text/csv",
+                    key="natural_language_hunt_download",
+                )
 
     data = events.copy()
     if "risk_score" not in data:

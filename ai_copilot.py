@@ -166,6 +166,67 @@ def build_handover_context(summary):
     }
 
 
+def build_incident_timeline_context(summary):
+    """Keep incident timeline reviews to event labels, timestamps, and counts only."""
+    if not isinstance(summary, dict):
+        return {}
+
+    def safe_counts(value, allowed):
+        if not isinstance(value, dict):
+            return {}
+        return {
+            _safe_token(key, 24): int(_number(count, lower=0, upper=1_000_000))
+            for key, count in value.items()
+            if _safe_token(key, 24) in allowed
+        }
+
+    allowed_severity = {"Critical", "High", "Medium", "Low", "Unknown"}
+    allowed_status = {"Open", "Acknowledged", "Resolved", "Closed", "Investigating", "Contained", "Unknown"}
+    timeline = []
+    for item in summary.get("timeline", [])[:40]:
+        if not isinstance(item, dict):
+            continue
+        timeline.append({
+            "occurred_at_utc": _safe_token(item.get("occurred_at"), 40),
+            "activity_type": _safe_token(item.get("event_type"), 48),
+        })
+    return {
+        "incident_id": int(_number(summary.get("incident_id"), lower=0, upper=1_000_000_000)),
+        "severity": _safe_token(summary.get("severity"), 16),
+        "status": _safe_token(summary.get("status"), 24),
+        "linked_alert_count": int(_number(summary.get("linked_alert_count"), lower=0, upper=1_000_000)),
+        "linked_alerts_by_severity": safe_counts(summary.get("alert_severity_counts"), allowed_severity),
+        "linked_alerts_by_status": safe_counts(summary.get("alert_status_counts"), allowed_status),
+        "timeline_event_count": int(_number(summary.get("timeline_event_count"), lower=0, upper=1_000_000)),
+        "timeline": timeline,
+        "follow_up_status_counts": safe_counts(summary.get("follow_up_status_counts"), {"Open", "In Progress", "Blocked", "Done"}),
+        "post_review_status": _safe_token(summary.get("post_review_status"), 16),
+    }
+
+
+def build_investigation_brief_context(summary):
+    """Build a compact, privacy-limited incident handoff context from aggregate fields."""
+    timeline_context = build_incident_timeline_context(summary)
+    if not timeline_context:
+        return {}
+    return {
+        "incident_id": timeline_context["incident_id"],
+        "severity": timeline_context["severity"],
+        "status": timeline_context["status"],
+        "linked_alert_count": timeline_context["linked_alert_count"],
+        "linked_alerts_by_severity": timeline_context["linked_alerts_by_severity"],
+        "linked_alerts_by_status": timeline_context["linked_alerts_by_status"],
+        "open_follow_up_count": sum(
+            count for status, count in timeline_context["follow_up_status_counts"].items()
+            if status in {"Open", "In Progress", "Blocked"}
+        ),
+        "blocked_follow_up_count": timeline_context["follow_up_status_counts"].get("Blocked", 0),
+        "timeline_event_count": timeline_context["timeline_event_count"],
+        "latest_activity_types": [item["activity_type"] for item in list(reversed(timeline_context["timeline"]))[:8]],
+        "post_review_status": timeline_context["post_review_status"],
+    }
+
+
 def _extract_text(response_json):
     parts = []
     for item in response_json.get("output", []):
@@ -202,6 +263,32 @@ def generate_review(
             "prioritize the listed follow-ups, and distinguish recorded facts from suggested next steps. Keep alert "
             "titles as evidence labels only. Do not infer compromise, root cause, or actor attribution; do not invent "
             "missing details or recommend destructive actions. Mention when the event sample is limited."
+        )
+    elif review_type == "incident_timeline":
+        task = (
+            "Summarize the provided incident timeline in chronological order. Use only the supplied UTC timestamps, "
+            "activity labels, severity/status, and counts. Clearly state when the timeline is sparse or incomplete. "
+            "Do not infer a cause, attacker, compromise, or actions that are not recorded. Keep this suitable for an analyst presentation."
+        )
+    elif review_type == "investigation_brief":
+        task = (
+            "Write a concise SOC investigation handoff with these headings: Current status, Recorded facts, "
+            "Open work, Suggested analyst checks. Use only the aggregate metadata supplied. Do not infer root cause, "
+            "compromise, actor attribution, or missing evidence. Treat every suggested check as a recommendation for "
+            "a human analyst; never suggest automatic blocking, deletion, or containment."
+        )
+    elif review_type == "false_positive":
+        task = (
+            "Review this transparent heuristic assessment of one security alert. Explain which supplied signals lean "
+            "benign or threat-like and what minimum evidence an analyst should validate next. The heuristic score is "
+            "not a calibrated probability or verdict. Do not recommend closing, suppressing, or changing the alert automatically."
+        )
+    elif review_type == "mitre_coverage":
+        task = (
+            "Review aggregate counts for this project's explicitly limited MITRE ATT&CK mapping catalog. Explain what "
+            "the observed counts mean and list practical telemetry checks for techniques with zero matched records. "
+            "Zero observations do not establish a detection gap or absence of activity. Do not claim coverage, compromise, "
+            "or attribution beyond the supplied sample."
         )
     else:
         task = (
