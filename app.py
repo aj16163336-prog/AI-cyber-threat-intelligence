@@ -5783,6 +5783,7 @@ def main():
 
     pages = [
         "Main Dashboard",
+        "Security Operations Toolkit",
         "Live Monitor",
         "Endpoint Security",
         "Threat Feed",
@@ -5793,7 +5794,6 @@ def main():
         "AI Model Evaluation Lab",
         "MITRE ATT&CK Map",
         "Alert System",
-        "Security Operations Toolkit",
         "Incident Management",
         "Report Generator",
         "Log Analyzer",
