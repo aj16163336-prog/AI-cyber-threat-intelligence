@@ -608,6 +608,79 @@ def apply_theme():
         .cti-login-title span { color:var(--cti-lime); }
         .cti-login-copy { max-width:34rem; color:#a6ada5; font-size:1rem; line-height:1.7; }
         .cti-login-points { margin-top:2rem; color:#c4c9c1; font-size:.86rem; line-height:2.2; }
+        /* Refined command-center styling: clearer hierarchy and consistent
+           interaction states across the dashboard widgets. */
+        ::selection { color:#11130c; background:#cede62; }
+        [data-testid="stAppViewContainer"] {
+            background:
+                radial-gradient(ellipse at 88% 4%, #252b1b 0%, transparent 34%),
+                radial-gradient(ellipse at 8% 100%, #151c19 0%, transparent 30%),
+                #0b0d0c;
+        }
+        [data-testid="stMainBlockContainer"] { padding-top:2.35rem; }
+        [data-testid="stHeader"] { backdrop-filter:blur(14px); }
+        [data-testid="stSidebar"] {
+            background:linear-gradient(180deg,#151916 0%,#101311 58%,#0e100f 100%);
+            box-shadow:12px 0 36px #00000018;
+        }
+        [data-testid="stSidebar"] [role="radiogroup"] label {
+            min-height:2.45rem; border:1px solid transparent;
+        }
+        [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) {
+            border-color:#cede6233;
+            background:linear-gradient(100deg,#303522 0%,#20241c 100%);
+            box-shadow:inset 3px 0 0 var(--cti-lime),0 5px 16px #00000020;
+        }
+        [data-testid="stSidebar"] [role="radiogroup"] label p {
+            font-size:.84rem; line-height:1.25rem;
+        }
+        h1,h2,h3,h4 { text-wrap:balance; }
+        h2 { margin-top:1.35rem; padding-bottom:.45rem; }
+        [data-testid="stMetric"] {
+            position:relative; overflow:hidden;
+            box-shadow:0 8px 24px #00000018;
+        }
+        [data-testid="stMetric"]::after {
+            content:""; position:absolute; inset:0 0 auto; height:2px;
+            background:linear-gradient(90deg,#cede6280,transparent 78%);
+            opacity:.65;
+        }
+        [data-testid="stMetricValue"] { font-size:clamp(1.45rem,2vw,2rem); }
+        [data-testid="stDataFrame"], [data-testid="stTable"] {
+            box-shadow:0 10px 26px #0000001a;
+        }
+        [data-testid="stDataFrame"] th { color:#dfe6d1 !important; }
+        [data-testid="stDataFrame"] tr:hover td { background:#cede620b !important; }
+        [data-testid="stExpander"] {
+            border:1px solid var(--cti-border); border-radius:12px;
+            background:#121513;
+        }
+        [data-testid="stTabs"] [role="tablist"] {
+            gap:.35rem; border-bottom:1px solid var(--cti-border);
+        }
+        [data-testid="stTabs"] button[role="tab"] {
+            border-radius:9px 9px 0 0; color:#aeb5aa;
+        }
+        [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+            color:var(--cti-lime); background:#cede620c;
+        }
+        [data-testid="stTextInput"] input:focus,
+        [data-testid="stTextArea"] textarea:focus,
+        [data-testid="stNumberInput"] input:focus,
+        [data-testid="stDateInput"] input:focus {
+            border-color:#cede62 !important;
+            box-shadow:0 0 0 2px #cede6222 !important;
+        }
+        [data-testid="stButton"] button:focus-visible,
+        [data-testid="stDownloadButton"] button:focus-visible,
+        [data-testid="stFormSubmitButton"] button:focus-visible {
+            outline:2px solid var(--cti-lime); outline-offset:2px;
+        }
+        [data-testid="stAlert"] { box-shadow:0 6px 18px #00000016; }
+        ::-webkit-scrollbar { width:10px; height:10px; }
+        ::-webkit-scrollbar-track { background:#0d100e; }
+        ::-webkit-scrollbar-thumb { background:#343a31; border:2px solid #0d100e; border-radius:99px; }
+        ::-webkit-scrollbar-thumb:hover { background:#626b4b; }
         @media (max-width: 760px) {
             [data-testid="stMainBlockContainer"] { padding:1.2rem 1rem 2rem; }
             .cti-page-heading { align-items:flex-start; flex-direction:column; }

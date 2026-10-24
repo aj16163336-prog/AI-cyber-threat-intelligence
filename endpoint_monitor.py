@@ -47,6 +47,12 @@ SUSPICIOUS_EXTENSIONS = {
     ".docm", ".xlsm", ".iso", ".img",
 }
 IGNORED_PATH_PARTS = {".venv", ".git", "__pycache__"}
+# This project database is inside a monitored Documents folder. Ignore its
+# SQLite writes so the sensor does not create endless events about itself.
+IGNORED_FILES = {
+    str((BASE_DIR / "security_center.db").resolve()).casefold(),
+    str((BASE_DIR / "cti_backend.db").resolve()).casefold(),
+}
 MAX_HASH_BYTES = 100 * 1024 * 1024
 POLL_SECONDS = 10
 APP_SCAN_SECONDS = 120
@@ -328,6 +334,11 @@ class FileEvents(FileSystemEventHandler):
 
     def _queue(self, value, kind):
         path = Path(value)
+        try:
+            if str(path.resolve()).casefold() in IGNORED_FILES:
+                return
+        except OSError:
+            return
         if any(part.casefold() in IGNORED_PATH_PARTS for part in path.parts):
             return
         try:
