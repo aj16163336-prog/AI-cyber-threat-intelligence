@@ -2139,6 +2139,17 @@ def load_sensor_events(limit=500):
         ), "local"
 
 
+def alert_source_event_id(source_event_id):
+    """Extract an endpoint event ID from alert source keys that reference one."""
+    source = str(source_event_id or "")
+    for prefix in ("endpoint:", "ai-endpoint:"):
+        if source.startswith(prefix):
+            return source[len(prefix):]
+    if source.startswith("watchlist:"):
+        return source.rsplit(":", 1)[-1]
+    return ""
+
+
 @st.cache_data(ttl=3, show_spinner=False)
 def load_cloud_sensor_heartbeats():
     """Read authenticated sensor heartbeats from the endpoint API."""
@@ -4615,6 +4626,84 @@ def render_local_email_settings():
                 st.error(f"Could not save local email settings: {error}")
 
 
+def render_related_alert_activity(selected_alert, alerts):
+    """Show recent endpoint events that share concrete indicators with an alert."""
+    selected_event_id = alert_source_event_id(selected_alert.get("source_event_id"))
+    st.markdown("#### Related activity leads")
+    st.caption("Recent endpoint events that share an exact process name, remote IP, or file hash with this alert. These are investigation leads, not proof that the events are part of the same incident.")
+    if not selected_event_id:
+        st.info("This alert is not directly linked to one endpoint event, so event-level relationship hints are unavailable.")
+        return
+    try:
+        events, event_source = load_sensor_events(limit=5000)
+    except Exception as error:
+        st.info(f"Related event lookup is unavailable right now ({type(error).__name__}).")
+        return
+    if events is None or events.empty:
+        st.info("No recent endpoint events are available for relationship review.")
+        return
+    id_column = next((column for column in ("event_id", "event_uid", "id") if column in events.columns), None)
+    if not id_column:
+        st.info("The available event records do not include stable event IDs for relationship review.")
+        return
+    event_ids = events[id_column].fillna("").astype(str)
+    selected_rows = events.loc[event_ids.eq(selected_event_id)]
+    if selected_rows.empty:
+        st.info("The originating event is outside the recent event window or is no longer available. No relationship was inferred.")
+        return
+    anchor = selected_rows.iloc[0]
+    indicators = {
+        "Process": ("process_name", str(anchor.get("process_name") or "").strip().casefold()),
+        "Remote IP": ("remote_ip", str(anchor.get("remote_ip") or "").strip()),
+        "File SHA-256": ("file_sha256", str(anchor.get("file_sha256") or "").strip().casefold()),
+    }
+    indicators = {label: pair for label, pair in indicators.items() if pair[1]}
+    if not indicators:
+        st.info("The originating event has no process name, remote IP, or file hash to compare.")
+        return
+    related_rows = []
+    related_ids = set()
+    for index, event in events.iterrows():
+        event_id = str(event.get(id_column) or "")
+        if not event_id or event_id == selected_event_id:
+            continue
+        matches = []
+        for label, (column, anchor_value) in indicators.items():
+            candidate = str(event.get(column) or "").strip()
+            if candidate and (candidate.casefold() if label != "Remote IP" else candidate) == anchor_value:
+                matches.append(label)
+        if not matches:
+            continue
+        related_ids.add(event_id)
+        related_rows.append({
+            "Time (UTC)": event.get("occurred_at") or event.get("created_at") or "Unknown",
+            "Sensor": str(event.get("sensor_id") or "Local sensor")[:16],
+            "Event": str(event.get("event_type") or "Unknown"),
+            "Shared evidence": ", ".join(matches),
+            "Risk": event.get("risk_score", "—"),
+            "Summary": str(event.get("summary") or "")[:180],
+        })
+    if related_rows:
+        related_frame = pd.DataFrame(related_rows)
+        related_frame["_sort_time"] = pd.to_datetime(related_frame["Time (UTC)"], errors="coerce", utc=True)
+        related_frame = related_frame.sort_values("_sort_time", ascending=False, na_position="last").drop(columns="_sort_time").head(30)
+        st.dataframe(related_frame, hide_index=True, width="stretch")
+    else:
+        st.info("No recent events share these exact indicators.")
+    if related_ids:
+        related_alerts = alerts[
+            alerts["source_event_id"].map(alert_source_event_id).isin(related_ids)
+            & alerts["id"].astype(int).ne(int(selected_alert["id"]))
+        ].copy() if "source_event_id" in alerts.columns else pd.DataFrame()
+        if not related_alerts.empty:
+            st.markdown("##### Alerts linked to matching events")
+            st.dataframe(
+                related_alerts[[column for column in ("id", "created_at", "severity", "status", "title") if column in related_alerts.columns]].head(20),
+                hide_index=True,
+                width="stretch",
+            )
+
+
 def render_alert_system():
     render_page_heading("Alert System")
     severity_levels = ["Critical", "High", "Medium", "Low"]
@@ -4750,6 +4839,7 @@ def render_alert_system():
 
     selected_alert = visible.loc[visible["id"].astype(int) == int(selected_id)].iloc[0]
     st.caption(f"Grouped observations: {int(selected_alert.get('occurrence_count', 1) or 1)} · Last observed: {selected_alert.get('last_seen_at') or selected_alert.get('created_at')}")
+    render_related_alert_activity(selected_alert.to_dict(), alerts)
     if str(selected_alert.get("SLA status", "")) == "OVERDUE":
         st.error("This alert has passed its review deadline.")
     with st.form(f"alert_assignment_sla_form_{selected_id}"):
