@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import smtplib
@@ -628,7 +629,7 @@ def render_page_heading(title):
         "Threat Feed": "Browse threat intelligence signals collected for investigation.",
         "IOC Analysis": "Inspect indicators of compromise and their related findings.",
         "Analytics Dashboard": "Explore risk trends and attack-category patterns across detections.",
-        "AI Engine": "Review the detection models and their latest analysis results.",
+        "AI Engine": "Review live anomaly scores, device baselines, attack-chain signals, analyst feedback, and drift warnings.",
         "Explainable AI Assistant": "Understand each live event's score, evidence, and suggested investigation steps.",
         "AI Model Evaluation Lab": "Measure model performance on labeled holdout data and inspect its errors.",
         "MITRE ATT&CK Map": "Connect observed activity with known adversary techniques.",
@@ -863,6 +864,42 @@ def init_database():
                 updated_at TEXT NOT NULL
             )"""
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS ai_baseline_events (
+                sensor_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT '',
+                process_name TEXT NOT NULL DEFAULT '',
+                risk_score REAL NOT NULL DEFAULT 0,
+                occurred_at TEXT NOT NULL,
+                baseline_score INTEGER NOT NULL DEFAULT 0,
+                baseline_reason TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (sensor_id, event_id)
+            )"""
+        )
+        baseline_columns = {row[1] for row in connection.execute("PRAGMA table_info(ai_baseline_events)")}
+        for column, declaration in (("baseline_score", "INTEGER NOT NULL DEFAULT 0"), ("baseline_reason", "TEXT NOT NULL DEFAULT ''"), ("sample_count", "INTEGER NOT NULL DEFAULT 0")):
+            if column not in baseline_columns:
+                connection.execute(f"ALTER TABLE ai_baseline_events ADD COLUMN {column} {declaration}")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_ai_baseline_sensor_time ON ai_baseline_events(sensor_id, occurred_at)")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS ai_analyst_feedback (
+                event_id TEXT PRIMARY KEY,
+                sensor_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                process_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                updated_by TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_ai_feedback_fingerprint ON ai_analyst_feedback(fingerprint)")
+        rule_columns = {row[1] for row in connection.execute("PRAGMA table_info(custom_detection_rules)")}
+        if "source" not in rule_columns:
+            connection.execute("ALTER TABLE custom_detection_rules ADD COLUMN source TEXT NOT NULL DEFAULT 'Analyst'")
 
 
 def audit_event(action, details="", username=None):
@@ -1624,9 +1661,10 @@ def render_detection_rule_builder():
         "name": "Rule", "event_type": "Event type", "process_contains": "Process contains",
         "remote_ip": "Remote IP", "file_extension": "Extension", "min_risk": "Min risk",
         "output_severity": "Alert severity", "enabled": "Enabled", "created_at": "Created (UTC)",
+        "source": "Source",
     })
     display["Enabled"] = display["Enabled"].map({1: "Yes", 0: "No"})
-    st.dataframe(display[["id", "Rule", "Event type", "Process contains", "Remote IP", "Extension", "Min risk", "Alert severity", "Enabled", "Created (UTC)"]], hide_index=True, width="stretch")
+    st.dataframe(display[["id", "Rule", "Event type", "Process contains", "Remote IP", "Extension", "Min risk", "Alert severity", "Source", "Enabled", "Created (UTC)"]], hide_index=True, width="stretch")
     if is_admin():
         selected = st.selectbox("Manage rule", rules["id"].astype(int).tolist(), format_func=lambda value: rules.loc[rules["id"].eq(value), "name"].iloc[0])
         first, second = st.columns(2)
@@ -2759,11 +2797,132 @@ def render_analytics(report):
                 st.write(report["risk_score"].describe())
 
 
+def ai_event_identity(event):
+    for key in ("event_id", "event_uid", "id"):
+        value = event.get(key)
+        if value is not None and not pd.isna(value) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def ai_event_fingerprint(sensor_id, event_type, process_name):
+    raw = "|".join((str(sensor_id).casefold(), str(event_type).casefold(), str(process_name).casefold()))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def apply_device_baselines(events):
+    """Score novel activity against each sensor's unique-event history, with analyst feedback."""
+    frame = events.copy()
+    if frame.empty:
+        frame["Device baseline score"] = pd.Series(dtype=int)
+        frame["Device baseline reason"] = pd.Series(dtype=str)
+        frame["Baseline sample count"] = pd.Series(dtype=int)
+        return frame
+    time_column = next((column for column in ("occurred_at", "created_at") if column in frame), None)
+    parsed_times = pd.to_datetime(frame[time_column], errors="coerce", utc=True) if time_column else pd.Series(pd.NaT, index=frame.index)
+    order = parsed_times.sort_values(kind="stable", na_position="last").index
+    output = {}
+    prepared = {}
+    for index in order:
+        row = frame.loc[index].to_dict()
+        def text_value(value, default=""):
+            return default if value is None or pd.isna(value) else str(value).strip()
+        sensor_id = text_value(row.get("sensor_id"), "Local sensor") or "Local sensor"
+        event_type = text_value(row.get("event_type"), "unknown").casefold() or "unknown"
+        process_name = text_value(row.get("process_name")).casefold()
+        event_id = ai_event_identity(row)
+        timestamp = parsed_times.loc[index]
+        occurred_at = timestamp.isoformat() if not pd.isna(timestamp) else datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if not event_id:
+            event_id = hashlib.sha256(f"{sensor_id}|{event_type}|{process_name}|{occurred_at}|{index}".encode("utf-8")).hexdigest()
+        try:
+            risk = max(0, min(100, int(float(row.get("risk_score") or 0))))
+        except (TypeError, ValueError):
+            risk = 0
+        prepared[index] = (sensor_id, event_id, event_type, process_name, risk, occurred_at)
+    with connect_db() as connection:
+        identities = list({(value[0], value[1]) for value in prepared.values()})
+        existing_rows = {}
+        for start in range(0, len(identities), 400):
+            chunk = identities[start:start + 400]
+            if not chunk:
+                continue
+            placeholders = ",".join("(?, ?)" for _ in chunk)
+            parameters = [item for pair in chunk for item in pair]
+            rows = connection.execute(
+                f"SELECT sensor_id, event_id, baseline_score, baseline_reason, sample_count FROM ai_baseline_events WHERE (sensor_id, event_id) IN ({placeholders})",
+                parameters,
+            ).fetchall()
+            existing_rows.update({(row[0], row[1]): (row[2], row[3], row[4]) for row in rows})
+        for index in order:
+            sensor_id, event_id, event_type, process_name, risk, occurred_at = prepared[index]
+            existing = existing_rows.get((sensor_id, event_id))
+            if existing:
+                output[index] = (int(existing[0]), str(existing[1]), int(existing[2]))
+                continue
+
+            prior = connection.execute(
+                """SELECT COUNT(*),
+                          SUM(CASE WHEN event_type = ? THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN process_name = ? AND process_name <> '' THEN 1 ELSE 0 END),
+                          AVG(risk_score), AVG(risk_score * risk_score)
+                   FROM ai_baseline_events WHERE sensor_id = ? AND occurred_at < ?""",
+                (event_type, process_name, sensor_id, occurred_at),
+            ).fetchone()
+            sample_count = int(prior[0] or 0)
+            event_type_count = int(prior[1] or 0)
+            process_count = int(prior[2] or 0)
+            mean_risk = float(prior[3] or 0)
+            variance = max(0.0, float(prior[4] or 0) - mean_risk * mean_risk)
+            score = 0
+            reasons = []
+            if sample_count >= 20:
+                if event_type_count == 0:
+                    score += 30
+                    reasons.append("New event type for this device")
+                if process_name and process_count == 0:
+                    score += 35
+                    reasons.append("New process for this device")
+                if risk >= mean_risk + max(25, 2 * variance ** 0.5):
+                    score += 35
+                    reasons.append(f"Risk {risk} is above this device's usual level ({mean_risk:.0f})")
+            fingerprint = ai_event_fingerprint(sensor_id, event_type, process_name)
+            feedback = connection.execute(
+                "SELECT verdict FROM ai_analyst_feedback WHERE fingerprint = ? ORDER BY updated_at DESC LIMIT 1",
+                (fingerprint,),
+            ).fetchone()
+            if feedback and feedback[0] == "Confirmed threat":
+                score = min(100, score + 25)
+                reasons.append("Analyst previously confirmed this device/process pattern")
+            elif feedback and feedback[0] == "Benign":
+                score = round(score * 0.25)
+                reasons.append("Analyst previously marked this device/process pattern benign")
+            reason = "; ".join(reasons) if reasons else (
+                f"Building this device's baseline ({sample_count}/20 events)" if sample_count < 20
+                else "No meaningful deviation from this device's baseline"
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO ai_baseline_events
+                   (sensor_id, event_id, event_type, process_name, risk_score, occurred_at, baseline_score, baseline_reason, sample_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sensor_id, event_id, event_type, process_name, risk, occurred_at, score, reason, sample_count),
+            )
+            output[index] = (score, reason, sample_count)
+        connection.execute(
+            "DELETE FROM ai_baseline_events WHERE rowid NOT IN (SELECT rowid FROM ai_baseline_events ORDER BY occurred_at DESC LIMIT 20000)"
+        )
+    frame["Device baseline score"] = pd.Series({index: value[0] for index, value in output.items()}).reindex(frame.index).fillna(0).astype(int)
+    frame["Device baseline reason"] = pd.Series({index: value[1] for index, value in output.items()}).reindex(frame.index).fillna("No device baseline available")
+    frame["Baseline sample count"] = pd.Series({index: value[2] for index, value in output.items()}).reindex(frame.index).fillna(0).astype(int)
+    return frame
+
+
 def live_event_features(events):
     """Build numeric, metadata-only features for the rolling endpoint model."""
     frame = pd.DataFrame(index=events.index)
     risk = pd.to_numeric(events.get("risk_score", pd.Series(0, index=events.index)), errors="coerce")
     frame["sensor_risk"] = risk.fillna(0).clip(0, 100)
+    frame["device_baseline_score"] = pd.to_numeric(events.get("Device baseline score", pd.Series(0, index=events.index)), errors="coerce").fillna(0).clip(0, 100)
 
     severity = events.get("severity", pd.Series("Info", index=events.index))
     frame["severity_level"] = severity.astype(str).str.lower().map(
@@ -2792,17 +2951,19 @@ def live_event_features(events):
 
 @st.cache_data(ttl=30, show_spinner=False)
 def analyze_live_events(events, model_minimum=20):
-    events = events.copy()
+    events = apply_device_baselines(events)
     features = live_event_features(events)
     anomaly_cutoff = get_detection_settings()["ai_anomaly_min_score"]
+    device_scores = pd.to_numeric(events.get("Device baseline score", pd.Series(0, index=events.index)), errors="coerce").fillna(0).clip(0, 100).astype(int)
     if len(events) >= model_minimum:
         if SKLEARN_AVAILABLE:
             model = IsolationForest(n_estimators=40, contamination="auto", random_state=42, n_jobs=1)
             predictions = model.fit_predict(features)
             decision = model.decision_function(features)
-            events["AI anomaly score"] = (pd.Series(-decision, index=events.index).rank(pct=True) * 100).round().astype(int)
-            events["AI anomaly"] = (predictions == -1) & events["AI anomaly score"].ge(anomaly_cutoff)
-            model_label = "Isolation Forest · rolling endpoint baseline"
+            global_scores = (pd.Series(-decision, index=events.index).rank(pct=True) * 100).round().astype(int)
+            events["AI anomaly score"] = pd.concat([global_scores.rename("rolling"), device_scores.rename("device")], axis=1).max(axis=1).astype(int)
+            events["AI anomaly"] = ((predictions == -1) & global_scores.ge(anomaly_cutoff)) | device_scores.ge(anomaly_cutoff)
+            model_label = "Isolation Forest + per-device behavioral baseline"
         else:
             severity_points = features["severity_level"].map({0.0: 0, 1.0: 8, 2.0: 22, 3.0: 35}).fillna(0)
             rare_process = features["process_frequency"].le(1) & features["process_frequency"].gt(0)
@@ -2812,14 +2973,15 @@ def analyze_live_events(events, model_minimum=20):
                 + rare_process.astype(int) * 20
                 + features["ioc_match"] * 60
                 + severity_points
+                + features["device_baseline_score"] * 0.5
             ).clip(0, 100)
-            events["AI anomaly score"] = raw_score.round().astype(int)
-            events["AI anomaly"] = raw_score.ge(anomaly_cutoff)
-            model_label = "Metadata anomaly rules · scientific-library fallback"
+            events["AI anomaly score"] = pd.concat([raw_score.round().astype(int).rename("metadata"), device_scores.rename("device")], axis=1).max(axis=1).astype(int)
+            events["AI anomaly"] = events["AI anomaly score"].ge(anomaly_cutoff)
+            model_label = "Metadata anomaly rules + per-device behavioral baseline"
     else:
-        events["AI anomaly"] = False
-        events["AI anomaly score"] = 0
-        model_label = f"Collecting baseline · {len(events)}/{model_minimum} events"
+        events["AI anomaly"] = device_scores.ge(anomaly_cutoff)
+        events["AI anomaly score"] = device_scores
+        model_label = f"Per-device baseline active · global model collecting {len(events)}/{model_minimum} events"
 
     if "summary" not in events:
         events["summary"] = ""
@@ -2856,10 +3018,10 @@ def analyze_live_events(events, model_minimum=20):
         if bool(process_rare.at[index]):
             signals.append("Process is rare in this event window")
         if bool(events.at[index, "AI anomaly"]):
-            if SKLEARN_AVAILABLE:
-                signals.append("ML model marked this event as an outlier")
-            else:
-                signals.append("Metadata anomaly rules flagged this event")
+            if int(device_scores.at[index]) >= anomaly_cutoff:
+                signals.append(str(events.at[index, "Device baseline reason"]))
+            if len(events) >= model_minimum:
+                signals.append("Rolling anomaly model flagged this event")
         reasons.append("; ".join(signals) if signals else "No elevated signal in current metadata")
     events["AI indicators"] = reasons
     return events, model_label
@@ -2899,6 +3061,10 @@ def render_live_ai_panel(show_assistant=False, live_openai_enabled=False):
 
     model_minimum = 20
     events, model_label = analyze_live_events(events, model_minimum)
+    chains = detect_ai_attack_chains(events)
+    chain_alerts = promote_ai_attack_chain_alerts(chains)
+    drift = model_drift_summary(events)
+    drift_alert_created = save_drift_alert(drift)
     live_ai_state = _queue_live_ai_review(events, live_openai_enabled)
 
     occurred_col = "occurred_at" if "occurred_at" in events else "created_at"
@@ -2907,16 +3073,41 @@ def render_live_ai_panel(show_assistant=False, live_openai_enabled=False):
         latest = str(events[occurred_col].dropna().astype(str).max())
     st.caption(f"Source: {source} endpoint sensor · Updated {datetime.now().astimezone().strftime('%H:%M:%S')} · Latest event: {latest}")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Events in rolling window", len(events))
     c2.metric("AI anomalies", int(events["AI anomaly"].sum()))
     c3.metric("Threat-feed IOC matches", int(events["Threat-intel IOC"].sum()))
     c4.metric("Highest AI risk", f"{events['AI risk score'].max():.0f}/100")
+    c5.metric("Attack chains", len(chains))
     st.caption(f"Live model: {model_label}. The anomaly score is a relative ranking within this window, not a malware probability or verdict.")
+    if drift["status"] == "Review drift":
+        st.warning("Model input drift needs review. " + drift["detail"])
+        if drift_alert_created:
+            st.caption("A model-drift review alert was added to Alert System.")
+    elif drift["status"] == "Stable":
+        st.caption(f"Model input health: {drift['status']} · drift score {drift['score']}/100 · {drift['detail']}")
+    else:
+        st.caption(f"Model input health: {drift['status']} · {drift['detail']}")
     _render_live_ai_review(live_openai_enabled, live_ai_state)
 
-    display_columns = [column for column in [occurred_col, "event_type", "AI severity", "AI risk score", "AI anomaly", "AI anomaly score", "AI indicators", "process_name", "remote_ip", "summary"] if column in events]
+    display_columns = [column for column in [occurred_col, "event_type", "AI severity", "AI risk score", "AI anomaly", "AI anomaly score", "Device baseline score", "Device baseline reason", "AI indicators", "process_name", "remote_ip", "summary"] if column in events]
     st.dataframe(events[display_columns].head(50), hide_index=True, width="stretch")
+    feedback = analyst_feedback_summary()
+    feedback_counts = {str(row["verdict"]): int(row["count"]) for row in feedback.to_dict("records")}
+    with st.expander("Analyst feedback learning"):
+        st.caption("Saved labels adjust future device/process baseline scores. They are not used to retrain the UNSW model automatically.")
+        feedback_metrics = st.columns(3)
+        feedback_metrics[0].metric("Confirmed threats", feedback_counts.get("Confirmed threat", 0))
+        feedback_metrics[1].metric("Benign", feedback_counts.get("Benign", 0))
+        feedback_metrics[2].metric("Needs investigation", feedback_counts.get("Needs investigation", 0))
+    if not chains.empty:
+        st.subheader("Possible attack chains")
+        st.caption("Same-device process, file, and network events grouped into a recent sequence. This is a review lead, not a confirmed attack.")
+        chain_columns = ["Sensor", "Stages", "Events", "Risk score", "IOC match", "Processes", "Remote IPs", "Latest event (UTC)"]
+        st.dataframe(chains[chain_columns], hide_index=True, width="stretch")
+        if chain_alerts:
+            st.success(f"Created {chain_alerts} new attack-chain review alert(s).")
+    render_ai_rule_suggestions(events)
     anomalies = events[events["AI anomaly"]]
     if not anomalies.empty:
         if st.button("Create review alerts for AI anomalies", key="create_ai_anomaly_alerts"):
@@ -2960,6 +3151,8 @@ def render_live_ai_panel(show_assistant=False, live_openai_enabled=False):
         else:
             next_steps = "Compare related events and timestamps, then document the analyst's conclusion in Incident Management."
         st.info("**Suggested investigation:** " + next_steps)
+        st.subheader("Analyst feedback")
+        render_analyst_feedback(selected.to_dict())
         event_context = build_event_context(selected.to_dict())
         mitre_signal = " ".join([event_context["event_type"], *event_context["rule_indicators"]])
         event_context["candidate_mitre_techniques"] = [
@@ -3024,6 +3217,238 @@ def create_ai_anomaly_alerts(events):
             source_event_id=f"ai-endpoint:{event_id}",
         ))
     return inserted
+
+
+def detect_ai_attack_chains(events):
+    """Find short, same-sensor process/file/network sequences for analyst review."""
+    if events is None or events.empty or "event_type" not in events:
+        return pd.DataFrame()
+    data = events.copy()
+    time_column = next((name for name in ("occurred_at", "created_at") if name in data), None)
+    if not time_column:
+        return pd.DataFrame()
+    data["_chain_time"] = pd.to_datetime(data[time_column], errors="coerce", utc=True)
+    data = data[data["_chain_time"].notna()].copy()
+    if data.empty:
+        return pd.DataFrame()
+    data["_sensor"] = data.get("sensor_id", pd.Series("Local sensor", index=data.index)).fillna("Local sensor").astype(str)
+    data["_kind"] = data["event_type"].fillna("").astype(str).map(
+        lambda value: "process" if value.startswith("process_") else "file" if value.startswith("file_") else "network" if "network" in value or "connection" in value else "other"
+    )
+    data["_risk"] = pd.to_numeric(data.get("risk_score", pd.Series(0, index=data.index)), errors="coerce").fillna(0).clip(0, 100)
+    now = pd.Timestamp.now(tz="UTC")
+    rows = []
+    for sensor_id, group in data.groupby("_sensor"):
+        group = group[group["_chain_time"].ge(now - pd.Timedelta(minutes=15))].sort_values("_chain_time")
+        stages = set(group["_kind"]) & {"process", "file", "network"}
+        if len(stages) < 2 or group.empty:
+            continue
+        ioc = group.get("Threat-intel IOC", pd.Series(False, index=group.index)).fillna(False).astype(bool).any()
+        max_risk = int(group["_risk"].max())
+        if not (len(stages) == 3 or (max_risk >= 80 or ioc)):
+            continue
+        score = min(100, len(stages) * 20 + int(max_risk * 0.35) + (25 if ioc else 0))
+        event_ids = [ai_event_identity(item) for item in group.to_dict("records")]
+        event_ids = [value for value in event_ids if value]
+        latest = group["_chain_time"].max()
+        bucket = latest.floor("15min").isoformat()
+        processes = sorted(set(group.get("process_name", pd.Series(dtype=str)).dropna().astype(str)) - {""})
+        addresses = sorted(set(group.get("remote_ip", pd.Series(dtype=str)).dropna().astype(str)) - {""})
+        summaries = group.get("summary", pd.Series("", index=group.index)).fillna("").astype(str).tolist()
+        rows.append({
+            "Sensor": sensor_id,
+            "Stages": ", ".join(sorted(stages)),
+            "Events": len(group),
+            "Risk score": score,
+            "Highest event risk": max_risk,
+            "IOC match": bool(ioc),
+            "Processes": ", ".join(processes[:6]),
+            "Remote IPs": ", ".join(addresses[:6]),
+            "Latest event (UTC)": latest.isoformat(),
+            "Event IDs": event_ids,
+            "Bucket": bucket,
+            "Evidence": "; ".join(item for item in summaries if item)[:1200],
+        })
+    return pd.DataFrame(rows).sort_values("Risk score", ascending=False) if rows else pd.DataFrame()
+
+
+def promote_ai_attack_chain_alerts(chains):
+    if chains is None or chains.empty:
+        return 0
+    inserted = 0
+    for chain in chains.to_dict("records"):
+        source_digest = hashlib.sha256(f"{chain['Sensor']}|{chain['Bucket']}".encode("utf-8")).hexdigest()[:32]
+        details = "\n".join([
+            "Source: explainable same-device event-sequence correlation",
+            f"Sensor: {chain['Sensor']}",
+            f"Observed stages: {chain['Stages']}",
+            f"Event count: {chain['Events']}",
+            f"Highest sensor risk: {chain['Highest event risk']}/100",
+            f"IOC match: {'yes' if chain['IOC match'] else 'no'}",
+            f"Processes: {chain['Processes'] or 'None recorded'}",
+            f"Remote IPs: {chain['Remote IPs'] or 'None recorded'}",
+            f"Event evidence: {chain['Evidence'] or 'No summary text recorded'}",
+            "This sequence is an investigation lead, not a confirmed attack verdict.",
+        ])
+        severity = "Critical" if int(chain["Risk score"]) >= 90 else "High"
+        mapped = map_signal_to_mitre(f"{chain['Stages']} {chain['Evidence']}")
+        inserted += int(add_alert(
+            f"Possible multi-stage activity: {chain['Sensor'][:40]}", severity, details,
+            mitre_id=mapped[0]["Technique ID"] if mapped else "",
+            source_event_id=f"ai-chain:{source_digest}",
+        ))
+    return inserted
+
+
+def model_drift_summary(events):
+    """Compare current event-type and risk distributions with earlier stored telemetry."""
+    if events is None or events.empty or len(events) < 20:
+        return {"status": "Collecting data", "score": None, "detail": "Need at least 20 current events and 50 earlier baseline events."}
+    current = events.copy()
+    time_column = next((name for name in ("occurred_at", "created_at") if name in current), None)
+    if not time_column:
+        return {"status": "Unavailable", "score": None, "detail": "Event timestamps are missing."}
+    current["_time"] = pd.to_datetime(current[time_column], errors="coerce", utc=True)
+    current = current[current["_time"].notna()].sort_values("_time").tail(100)
+    if len(current) < 20:
+        return {"status": "Collecting data", "score": None, "detail": "Need at least 20 timestamped current events."}
+    current_ids = [ai_event_identity(row) for row in current.to_dict("records")]
+    cutoff = current["_time"].min().isoformat()
+    with connect_db() as connection:
+        reference = pd.read_sql_query(
+            "SELECT event_type, risk_score FROM ai_baseline_events WHERE occurred_at < ? ORDER BY occurred_at DESC LIMIT 1000",
+            connection, params=(cutoff,),
+        )
+    if len(reference) < 50:
+        return {"status": "Collecting data", "score": None, "detail": f"Earlier baseline: {len(reference)}/50 events. More unique telemetry is needed."}
+    current_types = current.get("event_type", pd.Series("unknown", index=current.index)).fillna("unknown").astype(str).value_counts(normalize=True)
+    reference_types = reference["event_type"].fillna("unknown").astype(str).value_counts(normalize=True)
+    categories = set(current_types.index) | set(reference_types.index)
+    epsilon = 0.0001
+    type_psi = sum((current_types.get(category, 0.0) - reference_types.get(category, 0.0)) * math.log((current_types.get(category, 0.0) + epsilon) / (reference_types.get(category, 0.0) + epsilon)) for category in categories)
+    current_risk = pd.to_numeric(current.get("risk_score", pd.Series(0, index=current.index)), errors="coerce").fillna(0)
+    reference_risk = pd.to_numeric(reference["risk_score"], errors="coerce").fillna(0)
+    reference_std = float(reference_risk.std(ddof=0))
+    mean_shift = abs(float(current_risk.mean()) - float(reference_risk.mean()))
+    risk_z = mean_shift / max(reference_std, 10.0)
+    drift_score = round(max(min(type_psi / 0.5, 1.0), min(risk_z / 3, 1.0)) * 100)
+    drifted = type_psi >= 0.25 or risk_z >= 2.0
+    detail = f"Event-type PSI {type_psi:.3f}; sensor-risk mean shift {risk_z:.2f} baseline standard deviations; compared {len(current)} recent with {len(reference)} earlier events."
+    return {"status": "Review drift" if drifted else "Stable", "score": drift_score, "detail": detail, "psi": type_psi, "risk_z": risk_z}
+
+
+def save_drift_alert(summary):
+    if summary.get("status") != "Review drift":
+        return False
+    today = datetime.now(timezone.utc).date().isoformat()
+    return add_alert(
+        "AI model input drift detected", "Medium",
+        "The endpoint event distribution has changed compared with earlier observed telemetry. This may reflect a normal workload change or a sensor/configuration change. Review before changing model thresholds.\n" + str(summary.get("detail", "")),
+        source_event_id=f"model-drift:{today}",
+    )
+
+
+def ai_rule_suggestions(events):
+    """Mine repeated higher-risk patterns for disabled custom-rule drafts."""
+    if events is None or events.empty or "event_type" not in events:
+        return pd.DataFrame()
+    frame = events.copy()
+    frame["_risk"] = pd.to_numeric(frame.get("risk_score", pd.Series(0, index=frame.index)), errors="coerce").fillna(0)
+    frame = frame[frame["_risk"].ge(60)].copy()
+    if frame.empty:
+        return pd.DataFrame()
+    frame["event_type"] = frame["event_type"].fillna("").astype(str)
+    frame["process_name"] = frame.get("process_name", pd.Series("", index=frame.index)).fillna("").astype(str)
+    frame["remote_ip"] = frame.get("remote_ip", pd.Series("", index=frame.index)).fillna("").astype(str)
+    suggestions = []
+    for (event_type, process, remote_ip), group in frame.groupby(["event_type", "process_name", "remote_ip"], dropna=False):
+        if len(group) < 3 or not (process or remote_ip):
+            continue
+        median_risk = int(group["_risk"].median())
+        target = f"process {process}" if process else f"destination {remote_ip}"
+        suggestions.append({
+            "Rule name": f"AI suggestion: {event_type} / {target}"[:100],
+            "Event type": event_type,
+            "Process contains": process,
+            "Remote IP": "" if process else remote_ip,
+            "Minimum risk": max(40, min(median_risk, 95)),
+            "Repeated events": len(group),
+            "Highest risk": int(group["_risk"].max()),
+            "Reason": f"{len(group)} events share this pattern and have risk scores of at least 60.",
+        })
+    return pd.DataFrame(suggestions).sort_values(["Repeated events", "Highest risk"], ascending=False).head(20) if suggestions else pd.DataFrame()
+
+
+def render_ai_rule_suggestions(events):
+    suggestions = ai_rule_suggestions(events)
+    st.subheader("AI detection rule suggestions")
+    st.caption("Local pattern mining highlights repeated higher-risk metadata. Suggestions are saved disabled; Admin review is required to enable a rule.")
+    if suggestions.empty:
+        st.info("No repeated high-risk pattern is strong enough to suggest a rule in this event window.")
+        return
+    st.dataframe(suggestions, hide_index=True, width="stretch")
+    if not is_admin():
+        st.caption("Ask an Admin to save a suggestion as a disabled draft.")
+        return
+    selected = st.selectbox("Suggestion to save", suggestions["Rule name"].tolist(), key="ai_rule_suggestion_selected")
+    if st.button("Save as disabled rule draft", key="save_ai_rule_suggestion"):
+        rule = suggestions[suggestions["Rule name"].eq(selected)].iloc[0]
+        with connect_db() as connection:
+            connection.execute(
+                """INSERT INTO custom_detection_rules
+                   (name, event_type, process_contains, remote_ip, file_extension, min_risk, output_severity, enabled, created_at, source)
+                   VALUES (?, ?, ?, ?, '', ?, 'High', 0, ?, 'AI suggested')
+                   ON CONFLICT(name) DO UPDATE SET event_type=excluded.event_type,
+                   process_contains=excluded.process_contains, remote_ip=excluded.remote_ip,
+                   min_risk=excluded.min_risk, enabled=0, source='AI suggested'""",
+                (rule["Rule name"], rule["Event type"], rule["Process contains"], rule["Remote IP"],
+                 int(rule["Minimum risk"]), datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            )
+        audit_event("ai_detection_rule_draft_saved", f"name={selected[:100]}")
+        st.success("Saved as a disabled draft. Review it in Custom Detection Rule Builder before enabling.")
+
+
+def analyst_feedback_summary():
+    with connect_db() as connection:
+        return pd.read_sql_query(
+            "SELECT verdict, COUNT(*) AS count FROM ai_analyst_feedback GROUP BY verdict ORDER BY verdict",
+            connection,
+        )
+
+
+def render_analyst_feedback(event):
+    event_id = ai_event_identity(event)
+    if not event_id:
+        st.info("This event has no stable ID, so analyst feedback cannot be saved for it.")
+        return
+    sensor_id = str(event.get("sensor_id") or "Local sensor")
+    event_type = str(event.get("event_type") or "unknown")
+    process_name = str(event.get("process_name") or "")
+    fingerprint = ai_event_fingerprint(sensor_id, event_type, process_name)
+    with connect_db() as connection:
+        saved = connection.execute("SELECT verdict, note FROM ai_analyst_feedback WHERE event_id = ?", (event_id,)).fetchone()
+    verdicts = ["Needs investigation", "Confirmed threat", "Benign"]
+    default_verdict = verdicts.index(saved[0]) if saved and saved[0] in verdicts else 0
+    key = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:12]
+    with st.form(f"ai_feedback_form_{key}"):
+        verdict = st.selectbox("Analyst verdict", verdicts, index=default_verdict, key=f"ai_feedback_verdict_{key}")
+        note = st.text_input("Short evidence note (optional)", value=saved[1] if saved else "", max_chars=500, key=f"ai_feedback_note_{key}")
+        submitted = st.form_submit_button("Save AI feedback")
+    if submitted:
+        with connect_db() as connection:
+            connection.execute(
+                """INSERT INTO ai_analyst_feedback
+                   (event_id, sensor_id, event_type, process_name, fingerprint, verdict, note, updated_by, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_id) DO UPDATE SET sensor_id=excluded.sensor_id, event_type=excluded.event_type,
+                   process_name=excluded.process_name, fingerprint=excluded.fingerprint, verdict=excluded.verdict,
+                   note=excluded.note, updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
+                (event_id, sensor_id, event_type, process_name, fingerprint, verdict, note.strip(),
+                 str(st.session_state.get("username", "analyst")), datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            )
+        audit_event("ai_analyst_feedback_saved", f"event_id={event_id[:100]}; verdict={verdict}")
+        st.success("Feedback saved. Confirmed/benign labels adjust future scores for the same device/process/event pattern.")
+        st.rerun()
 
 
 def render_ai_engine(report):
@@ -3426,6 +3851,8 @@ def render_alert_system():
             analyzed_events, _ = analyze_live_events(endpoint_events)
             ai_anomalies = analyzed_events[analyzed_events["AI anomaly"]]
             new_alerts += create_ai_anomaly_alerts(ai_anomalies)
+            new_alerts += promote_ai_attack_chain_alerts(detect_ai_attack_chains(analyzed_events))
+            save_drift_alert(model_drift_summary(analyzed_events))
         if new_alerts:
             st.success(f"Added {new_alerts} new endpoint/AI review alert(s).")
     except Exception as error:
