@@ -3702,6 +3702,7 @@ def render_ai_engine(report):
         render_live_ai_panel(live_openai_enabled=live_openai_enabled)
 
     live_panel()
+    render_ai_feedback_threshold_lab()
     with st.expander("Historical UNSW-NB15 model output"):
         st.write("This is a separate offline dataset report. It is not used to label live files or endpoint activity.")
         if report.empty:
@@ -3709,6 +3710,122 @@ def render_ai_engine(report):
         else:
             st.write(f"Historical report rows: {len(report)}")
             st.dataframe(report.head(10), hide_index=True, width="stretch")
+
+
+def feedback_threshold_metrics(labeled_events):
+    """Estimate alert-threshold precision/recall from analyst-labeled live events."""
+    if labeled_events.empty:
+        return pd.DataFrame()
+    scores = pd.to_numeric(labeled_events["AI risk score"], errors="coerce").fillna(0)
+    actual = labeled_events["verdict"].eq("Confirmed threat")
+    rows = []
+    for threshold in range(20, 96, 5):
+        predicted = scores.ge(threshold)
+        tp = int((predicted & actual).sum())
+        fp = int((predicted & ~actual).sum())
+        fn = int((~predicted & actual).sum())
+        tn = int((~predicted & ~actual).sum())
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        rows.append({
+            "Risk threshold": threshold,
+            "Precision": precision,
+            "Recall": recall,
+            "F1": f1,
+            "Alerts on labeled events": tp + fp,
+            "Missed confirmed threats": fn,
+            "True negatives": tn,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_ai_feedback_threshold_lab():
+    st.subheader("AI Feedback Calibration Lab")
+    st.caption(
+        "Compare alert-risk cutoffs against endpoint events analysts marked Confirmed threat or Benign. "
+        "This is a recent-window estimate, not a held-out accuracy claim or malware probability."
+    )
+    try:
+        events, source = load_sensor_events(limit=2000)
+        if events.empty:
+            st.info("No endpoint events are available for calibration yet.")
+            return
+        scored, model_label = analyze_live_events(events)
+        identity_column = next((name for name in ("event_id", "event_uid", "id") if name in scored), None)
+        if not identity_column:
+            st.info("These events do not include stable IDs, so they cannot be matched to analyst feedback.")
+            return
+        scored["_feedback_event_id"] = scored[identity_column].fillna("").astype(str)
+        with connect_db() as connection:
+            feedback = pd.read_sql_query(
+                "SELECT event_id, verdict FROM ai_analyst_feedback WHERE verdict IN ('Confirmed threat', 'Benign')",
+                connection,
+            )
+        labeled = scored.merge(feedback, left_on="_feedback_event_id", right_on="event_id", how="inner")
+    except Exception as error:
+        st.warning(f"Could not build the feedback calibration view: {error}")
+        return
+
+    if labeled.empty:
+        st.info("Label events in Explainable AI Assistant to start collecting calibration data.")
+        return
+
+    counts = labeled["verdict"].value_counts()
+    confirmed = int(counts.get("Confirmed threat", 0))
+    benign = int(counts.get("Benign", 0))
+    summary = st.columns(3)
+    summary[0].metric("Labeled endpoint events", len(labeled))
+    summary[1].metric("Confirmed threats", confirmed)
+    summary[2].metric("Marked benign", benign)
+    metrics = feedback_threshold_metrics(labeled)
+    minimum_per_class = 2
+    enough_labels = confirmed >= minimum_per_class and benign >= minimum_per_class
+    if enough_labels:
+        best = metrics.sort_values(["F1", "Precision", "Risk threshold"], ascending=[False, False, False]).iloc[0]
+        st.success(
+            f"Best observed F1 in this labeled window: threshold {int(best['Risk threshold'])} "
+            f"(precision {best['Precision']:.0%}, recall {best['Recall']:.0%})."
+        )
+    else:
+        st.warning(
+            f"Need at least {minimum_per_class} Confirmed threat and {minimum_per_class} Benign labels "
+            "before suggesting a cutoff. Current counts are too small for a useful comparison."
+        )
+
+    settings = get_detection_settings()
+    current_threshold = settings["endpoint_alert_min_risk"]
+    selected_threshold = st.slider(
+        "Endpoint alert risk threshold",
+        min_value=20,
+        max_value=95,
+        value=max(20, min(95, current_threshold)),
+        step=5,
+        key="ai_feedback_calibration_threshold",
+        help="A higher threshold reduces the number of alerts and may miss more labeled threats.",
+    )
+    selected_row = metrics.iloc[(metrics["Risk threshold"] - selected_threshold).abs().argsort()[:1]]
+    if not selected_row.empty:
+        row = selected_row.iloc[0]
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Estimated precision", f"{row['Precision']:.0%}")
+        metric_cols[1].metric("Estimated recall", f"{row['Recall']:.0%}")
+        metric_cols[2].metric("F1", f"{row['F1']:.2f}")
+        metric_cols[3].metric("Labeled events alerted", int(row["Alerts on labeled events"]))
+    st.dataframe(metrics.style.format({"Precision": "{:.0%}", "Recall": "{:.0%}", "F1": "{:.2f}"}), hide_index=True, width="stretch")
+    st.caption(f"Scoring source: {source} · {model_label}. Only saved analyst labels in this app are used; unlabeled events do not count as benign.")
+    if is_admin():
+        if st.button(
+            "Apply selected risk threshold",
+            key="apply_ai_feedback_threshold",
+            disabled=not enough_labels or selected_threshold == current_threshold,
+        ):
+            save_detection_settings(selected_threshold, settings["ai_anomaly_min_score"])
+            audit_event("ai_feedback_threshold_applied", f"threshold={selected_threshold}; labels={len(labeled)}")
+            st.success(f"Endpoint alert risk threshold updated to {selected_threshold}.")
+            st.rerun()
+    else:
+        st.caption("An Admin can apply the selected threshold after enough analyst labels are available.")
 
 
 def render_explainable_ai_assistant():
