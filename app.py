@@ -4145,7 +4145,6 @@ def render_local_email_settings():
                 st.error(f"Could not save local email settings: {error}")
 
 
-@st.fragment(run_every="5s")
 def render_alert_system():
     render_page_heading("Alert System")
     severity_levels = ["Critical", "High", "Medium", "Low"]
@@ -4201,20 +4200,23 @@ def render_alert_system():
         else:
             st.info("Email notifications are off. Enable EMAIL_ALERTS_ENABLED and configure SMTP in your app's private Secrets, then restart/redeploy the app.")
     st.caption("Every new alert at or above the selected level triggers an in-app notification and, when configured, an email. Repeated records are deduplicated by the alert engine.")
-    try:
-        endpoint_events, _ = load_sensor_events(limit=1000)
-        new_alerts = sync_endpoint_alerts(endpoint_events)
-        new_alerts += sync_watchlist_alerts(endpoint_events)
-        if len(endpoint_events) >= 20:
-            analyzed_events, _ = analyze_live_events(endpoint_events)
-            ai_anomalies = analyzed_events[analyzed_events["AI anomaly"]]
-            new_alerts += create_ai_anomaly_alerts(ai_anomalies)
-            new_alerts += promote_ai_attack_chain_alerts(detect_ai_attack_chains(analyzed_events))
-            save_drift_alert(model_drift_summary(analyzed_events))
-        if new_alerts:
-            st.success(f"Added {new_alerts} new endpoint/AI review alert(s).")
-    except Exception as error:
-        st.warning(f"Could not check live endpoint events: {error}")
+    st.caption("Auto-refresh is off. Notifications stay on this page until you check for new alerts or another module records one.")
+    if st.button("Check for new notifications", type="primary", key="alert_system_check_new"):
+        try:
+            load_sensor_events.clear()
+            load_cloud_sensor_heartbeats.clear()
+            endpoint_events, _ = load_sensor_events(limit=1000)
+            new_alerts = sync_endpoint_alerts(endpoint_events)
+            new_alerts += sync_watchlist_alerts(endpoint_events)
+            if len(endpoint_events) >= 20:
+                analyzed_events, _ = analyze_live_events(endpoint_events)
+                ai_anomalies = analyzed_events[analyzed_events["AI anomaly"]]
+                new_alerts += create_ai_anomaly_alerts(ai_anomalies)
+                new_alerts += promote_ai_attack_chain_alerts(detect_ai_attack_chains(analyzed_events))
+                save_drift_alert(model_drift_summary(analyzed_events))
+            st.success(f"Checked current activity. {new_alerts} new notification(s) added.")
+        except Exception as error:
+            st.warning(f"Could not check live endpoint events: {error}")
 
     alerts = hide_cleared_notifications(load_alerts())
     if not alerts.empty and {"due_at", "status"}.issubset(alerts.columns):
