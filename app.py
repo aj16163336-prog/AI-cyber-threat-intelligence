@@ -1579,7 +1579,8 @@ def notify_security_alert(severity, title):
     threshold = st.session_state.get("alert_notification_threshold", setting("ALERT_NOTIFY_MINIMUM", "High"))
     if ranks.get(str(severity), 0) < ranks.get(str(threshold), 3):
         return
-    st.toast(f"{severity} alert: {title}", icon="🚨")
+    if st.session_state.get("in_app_notifications_enabled", True):
+        st.toast(f"{severity} alert: {title}", icon="🚨")
     if setting("EMAIL_ALERTS_ENABLED", "false").lower() not in {"1", "true", "yes"}:
         return
     try:
@@ -4150,6 +4151,13 @@ def render_alert_system():
     severity_levels = ["Critical", "High", "Medium", "Low"]
     configured_threshold = setting("ALERT_NOTIFY_MINIMUM", "High").title()
     default_index = severity_levels.index(configured_threshold) if configured_threshold in severity_levels else 1
+    st.session_state.setdefault("in_app_notifications_enabled", True)
+    in_app_notifications_enabled = st.toggle(
+        "In-app notifications",
+        key="in_app_notifications_enabled",
+        help="Show an in-app toast when a new alert at or above the selected severity is created. This starts ON each session.",
+    )
+    st.caption("In-app notification toasts are " + ("ON" if in_app_notifications_enabled else "OFF") + ". Email has its own separate switch.")
     notification_minimum = st.selectbox("Notification threshold (in-app and email)", severity_levels, index=default_index, key="alert_notification_threshold")
     if is_admin():
         render_local_email_settings()
