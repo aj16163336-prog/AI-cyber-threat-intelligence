@@ -51,6 +51,7 @@ from ai_copilot import (
     DEFAULT_MODEL as DEFAULT_OPENAI_MODEL,
     build_event_context,
     build_evaluation_context,
+    build_handover_context,
     generate_review,
 )
 from live_capture import capture_summary, list_interfaces
@@ -2513,6 +2514,132 @@ def make_incident_pdf(incident, alerts, timeline):
     return buffer.getvalue()
 
 
+def build_shift_handover_brief(events, alerts, incidents, event_source):
+    """Build a factual, exportable shift summary and bounded AI-review payload."""
+    now = datetime.now(timezone.utc)
+    active = alerts[alerts["status"].isin(["Open", "Acknowledged"])].copy() if not alerts.empty else alerts
+    open_incidents = incidents[incidents.get("status", pd.Series(dtype=str)).astype(str).str.casefold().eq("open")] if not incidents.empty else incidents
+    severity_counts = {
+        severity: int(active["severity"].astype(str).str.casefold().eq(severity.casefold()).sum())
+        if not active.empty and "severity" in active else 0
+        for severity in ("Critical", "High", "Medium", "Low")
+    }
+    if not active.empty and "assigned_to" in active:
+        unassigned_count = int(active["assigned_to"].fillna("").astype(str).str.strip().eq("").sum())
+    else:
+        unassigned_count = len(active)
+    overdue_count = 0
+    if not active.empty and "due_at" in active:
+        due = pd.to_datetime(active["due_at"], errors="coerce", utc=True)
+        overdue_count = int((due.notna() & due.lt(pd.Timestamp(now))).sum())
+
+    risk_column = "AI risk score" if "AI risk score" in events else "risk_score"
+    risk_values = pd.to_numeric(events.get(risk_column, pd.Series(0, index=events.index)), errors="coerce").fillna(0)
+    high_risk_count = int(risk_values.ge(70).sum()) if not events.empty else 0
+    event_type_counts = (
+        events.get("event_type", pd.Series(dtype=str)).fillna("Unknown").astype(str).value_counts().head(8)
+        if not events.empty else pd.Series(dtype=int)
+    )
+    sensor_report = sensor_health_report(events, event_source)
+
+    priorities = []
+    follow_ups = []
+    if severity_counts["Critical"]:
+        follow_ups.append(f"Review {severity_counts['Critical']} Critical active alert(s) first.")
+    if overdue_count:
+        follow_ups.append(f"Reassess {overdue_count} overdue alert(s) and update their investigation timelines.")
+    if unassigned_count:
+        follow_ups.append(f"Assign an owner to {unassigned_count} active alert(s) without an analyst.")
+    if str(sensor_report.get("status", "")).casefold() not in {"online", "healthy"}:
+        follow_ups.append(f"Check endpoint sensor status: {sensor_report.get('status', 'Unknown')}.")
+    if high_risk_count:
+        follow_ups.append(f"Validate {high_risk_count} high-risk event(s) in the current telemetry sample against their evidence.")
+    if not follow_ups:
+        follow_ups.append("No urgent follow-up was identified from the current snapshot; continue normal monitoring.")
+
+    if not active.empty:
+        priorities_frame = active.copy()
+        priorities_frame["_priority"] = priorities_frame.get("severity", pd.Series("Low", index=priorities_frame.index)).astype(str).str.title().map(
+            {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+        ).fillna(4)
+        sort_columns = ["_priority"] + (["created_at"] if "created_at" in priorities_frame else [])
+        priorities_frame = priorities_frame.sort_values(sort_columns, ascending=[True, False][:len(sort_columns)]).head(5)
+        for row in priorities_frame.to_dict("records"):
+            priorities.append({
+                "severity": str(row.get("severity") or "Unknown"),
+                "status": str(row.get("status") or "Open"),
+                "title": str(row.get("title") or "Untitled alert"),
+                "assigned_to": str(row.get("assigned_to") or ""),
+            })
+
+    summary = {
+        "generated_at_utc": now.isoformat(timespec="seconds"),
+        "event_source": event_source,
+        "sensor_status": sensor_report.get("status", "Unknown"),
+        "recent_event_count": len(events),
+        "high_risk_event_count": high_risk_count,
+        "event_type_counts": [
+            {"event_type": str(name), "count": int(count)}
+            for name, count in event_type_counts.items()
+        ],
+        "active_alert_count": len(active),
+        "active_alert_counts": severity_counts,
+        "unassigned_alert_count": unassigned_count,
+        "overdue_alert_count": overdue_count,
+        "open_incident_count": len(open_incidents),
+        "priority_alerts": priorities,
+        "follow_up_items": follow_ups,
+    }
+
+    lines = [
+        "### Shift snapshot",
+        f"- Generated (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Event source: {event_source}",
+        f"- Sensor: {sensor_report.get('status', 'Unknown')} · last heartbeat {sensor_report.get('last_heartbeat', 'Unknown')} · cloud sync {sensor_report.get('cloud_sync', 'Unknown')}",
+        f"- Events in the current {len(events)}-event sample: {high_risk_count} at AI/sensor risk 70 or higher",
+        f"- Active alerts: {len(active)} (Critical {severity_counts['Critical']} · High {severity_counts['High']} · Medium {severity_counts['Medium']} · Low {severity_counts['Low']})",
+        f"- Open incidents: {len(open_incidents)} · Unassigned alerts: {unassigned_count} · Overdue alerts: {overdue_count}",
+        "",
+        "### Priority alerts",
+    ]
+    if priorities:
+        lines.extend(
+            f"- **{item['severity']} / {item['status']}** — {item['title']} · {('Assigned' if item['assigned_to'] else 'Unassigned')}"
+            for item in priorities
+        )
+    else:
+        lines.append("- No active alerts in the current snapshot.")
+    lines.extend(["", "### Recommended follow-ups"])
+    lines.extend(f"- {item}" for item in follow_ups)
+    lines.extend(["", "_This is a snapshot-based triage aid. Verify evidence and sensor coverage before handing over._"])
+    return "\n".join(lines), summary
+
+
+def render_shift_handover_brief(events, alerts, incidents, event_source):
+    brief, raw_context = build_shift_handover_brief(events, alerts, incidents, event_source)
+    payload = build_handover_context(raw_context)
+    with st.expander("Shift handover brief", expanded=False):
+        st.caption("A snapshot of live telemetry, active alerts, sensor health, incidents, and pending analyst follow-ups.")
+        st.markdown(brief)
+        st.download_button(
+            "Download shift handover (.md)",
+            data=brief.encode("utf-8"),
+            file_name=f"soc_shift_handover_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.md",
+            mime="text/markdown",
+            key="download_soc_shift_handover",
+        )
+    context_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    render_optional_ai_review(
+        payload=payload,
+        review_type="handover",
+        key_suffix=context_id,
+        disclosure=(
+            "Only aggregate event/alert counts, sensor status, event types, and up to five short alert titles/statuses are sent after consent and a button click. "
+            "File contents, full paths, file hashes, and analyst names are excluded. Alert titles can contain process or indicator labels. API usage may be billed."
+        ),
+    )
+
+
 def render_dashboard(report):
     endpoint_events = pd.DataFrame()
     event_source = "local"
@@ -2642,6 +2769,8 @@ def render_dashboard(report):
                 recent = recent.rename(columns={"created_at": "occurred_at"})
             columns = [name for name in ("occurred_at", "sensor_id", "event_type", "severity", "summary", "risk_score") if name in recent]
             st.dataframe(recent[columns], hide_index=True, width="stretch")
+
+    render_shift_handover_brief(endpoint_events, alerts, incidents, event_source)
 
 
 def render_live_monitor():

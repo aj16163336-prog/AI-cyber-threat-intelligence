@@ -118,6 +118,54 @@ def build_evaluation_context(result, target, source):
     }
 
 
+def build_handover_context(summary):
+    """Return a bounded, allow-listed SOC shift summary for optional AI wording."""
+    if not isinstance(summary, dict):
+        return {}
+    severity_counts = {}
+    raw_counts = summary.get("active_alert_counts", {})
+    if isinstance(raw_counts, dict):
+        for name, count in raw_counts.items():
+            safe_name = _safe_token(name, 16)
+            if safe_name:
+                severity_counts[safe_name] = int(_number(count, lower=0, upper=1_000_000))
+    event_types = []
+    for item in summary.get("event_type_counts", [])[:8]:
+        if isinstance(item, dict):
+            event_types.append({
+                "event_type": _safe_token(item.get("event_type"), 48),
+                "count": int(_number(item.get("count"), lower=0, upper=1_000_000)),
+            })
+    alerts = []
+    for item in summary.get("priority_alerts", [])[:5]:
+        if isinstance(item, dict):
+            alerts.append({
+                "severity": _safe_token(item.get("severity"), 16),
+                "status": _safe_token(item.get("status"), 24),
+                "title": _safe_token(item.get("title"), 120),
+                "assignment": "Assigned" if _safe_token(item.get("assigned_to"), 48) else "Unassigned",
+            })
+    return {
+        "generated_at_utc": _safe_token(summary.get("generated_at_utc"), 40),
+        "event_source": _safe_token(summary.get("event_source"), 24),
+        "sensor_status": _safe_token(summary.get("sensor_status"), 32),
+        "recent_event_count": int(_number(summary.get("recent_event_count"), lower=0, upper=1_000_000)),
+        "high_risk_event_count": int(_number(summary.get("high_risk_event_count"), lower=0, upper=1_000_000)),
+        "event_type_counts": event_types,
+        "active_alert_count": int(_number(summary.get("active_alert_count"), lower=0, upper=1_000_000)),
+        "active_alert_counts": severity_counts,
+        "unassigned_alert_count": int(_number(summary.get("unassigned_alert_count"), lower=0, upper=1_000_000)),
+        "overdue_alert_count": int(_number(summary.get("overdue_alert_count"), lower=0, upper=1_000_000)),
+        "open_incident_count": int(_number(summary.get("open_incident_count"), lower=0, upper=1_000_000)),
+        "priority_alerts": alerts,
+        "follow_up_items": [
+            _safe_token(item, 180)
+            for item in summary.get("follow_up_items", [])[:8]
+            if _safe_token(item, 180)
+        ],
+    }
+
+
 def _extract_text(response_json):
     parts = []
     for item in response_json.get("output", []):
@@ -147,6 +195,13 @@ def generate_review(
             "Review these aggregate cybersecurity model-evaluation metrics. Explain what is strong, "
             "what is weak, class-imbalance implications, and 2-4 safe validation improvements. "
             "Do not claim production or live detection performance from this benchmark."
+        )
+    elif review_type == "handover":
+        task = (
+            "Prepare a concise SOC shift handover from these aggregate dashboard facts. State the current posture, "
+            "prioritize the listed follow-ups, and distinguish recorded facts from suggested next steps. Keep alert "
+            "titles as evidence labels only. Do not infer compromise, root cause, or actor attribution; do not invent "
+            "missing details or recommend destructive actions. Mention when the event sample is limited."
         )
     else:
         task = (
