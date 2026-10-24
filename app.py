@@ -5893,6 +5893,90 @@ def render_asset_inventory():
     metrics[1].metric("Online", int(fleet["Status"].astype(str).eq("Online").sum()))
     metrics[2].metric("Offline / stale", int(fleet["Status"].astype(str).isin(["Offline", "No recent event"]).sum()))
     metrics[3].metric("Recent events", int(pd.to_numeric(fleet["Observed events"], errors="coerce").fillna(0).sum()))
+    st.subheader("Sensor telemetry coverage")
+    coverage_hours = st.selectbox(
+        "Review window",
+        [1, 6, 24, 168],
+        index=2,
+        format_func=lambda value: f"Last {value} hour(s)" if value < 24 else f"Last {value // 24} day(s)",
+        key="sensor_coverage_window",
+    )
+    coverage_events = events.copy()
+    if not coverage_events.empty and "sensor_id" not in coverage_events:
+        coverage_events["sensor_id"] = "Local sensor"
+    coverage_time_col = next((name for name in ("occurred_at", "created_at") if name in coverage_events), None)
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=int(coverage_hours))
+    if not coverage_events.empty and coverage_time_col:
+        coverage_events["_coverage_time"] = pd.to_datetime(coverage_events[coverage_time_col], errors="coerce", utc=True)
+        coverage_events = coverage_events[coverage_events["_coverage_time"].ge(cutoff)].copy()
+    elif not coverage_events.empty:
+        st.warning("Event timestamps are unavailable, so the selected review window cannot be applied accurately.")
+        coverage_events = coverage_events.iloc[0:0].copy()
+
+    channel_matchers = {
+        "File activity": lambda values: values.str.startswith("file_"),
+        "Process starts": lambda values: values.str.startswith("process_"),
+        "Installed apps": lambda values: values.eq("application_installed"),
+        "Network connections": lambda values: values.str.contains("network|connection", regex=True),
+    }
+    coverage_rows = []
+    missing_channels = []
+    for sensor in sensor_rows:
+        sensor_id = str(sensor["Sensor ID"])
+        group = coverage_events[
+            coverage_events.get("sensor_id", pd.Series("Local sensor", index=coverage_events.index))
+            .fillna("Local sensor").astype(str).eq(sensor_id)
+        ] if not coverage_events.empty else coverage_events
+        types = group.get("event_type", pd.Series("", index=group.index)).fillna("").astype(str).str.lower()
+        row = {
+            "Device": str(sensor.get("Device") or sensor_id[:12]),
+            "Sensor ID": sensor_id[:16],
+            "Heartbeat": sensor.get("Status", "Unknown"),
+        }
+        missing = []
+        for channel, matcher in channel_matchers.items():
+            count = int(matcher(types).sum())
+            row[channel] = count
+            if count == 0:
+                missing.append(channel)
+                missing_channels.append((sensor_id, str(sensor.get("Device") or sensor_id[:12]), channel))
+        row["No events observed"] = ", ".join(missing) if missing else "None"
+        coverage_rows.append(row)
+    st.caption(f"Counts are based on events in the most recent 10,000-record window and selected time range. ‘No events observed’ means no matching record was found; it does not prove a sensor failure.")
+    st.dataframe(pd.DataFrame(coverage_rows), hide_index=True, width="stretch")
+    if missing_channels:
+        coverage_options = {
+            f"{device} · {channel}": (sensor_id, device, channel)
+            for sensor_id, device, channel in missing_channels
+        }
+        with st.form("sensor_coverage_review_form"):
+            coverage_selection = st.selectbox("Potential gap to review", list(coverage_options))
+            coverage_note = st.text_input("Analyst context (optional)", max_chars=240, placeholder="e.g. quiet workload, sensor filter, or expected behavior")
+            coverage_submitted = st.form_submit_button("Create coverage review alert")
+        if coverage_submitted:
+            sensor_id, device, channel = coverage_options[coverage_selection]
+            window_start = cutoff.isoformat()
+            digest = hashlib.sha256(f"{sensor_id}|{channel}|{coverage_hours}|{cutoff.date().isoformat()}".encode("utf-8")).hexdigest()[:28]
+            details = "\n".join([
+                "Source: analyst-requested sensor telemetry coverage review",
+                f"Device: {device}",
+                f"Sensor ID: {sensor_id}",
+                f"Channel with no observed events: {channel}",
+                f"Review window: {coverage_hours} hour(s) since {window_start} UTC",
+                f"Current heartbeat status: {next((item.get('Status', 'Unknown') for item in sensor_rows if str(item['Sensor ID']) == sensor_id), 'Unknown')}",
+                f"Analyst context: {coverage_note.strip() or 'Not provided'}",
+                "No endpoint scan or extra collection was started. A quiet event channel can be normal and requires verification.",
+            ])
+            created = add_alert(
+                f"Telemetry coverage review: {channel} · {device[:60]}",
+                "Medium",
+                details,
+                source_event_id=f"sensor-coverage-review:{digest}",
+            )
+            if created:
+                st.success("Coverage review alert added to the Alert System.")
+            else:
+                st.info("This coverage review alert was already recorded for the selected time window.")
     status_filter = st.multiselect("Device status", sorted(fleet["Status"].dropna().astype(str).unique()), default=sorted(fleet["Status"].dropna().astype(str).unique()), key="fleet_status_filter")
     filtered_fleet = fleet[fleet["Status"].astype(str).isin(status_filter)]
     st.dataframe(filtered_fleet, hide_index=True, width="stretch")
